@@ -96,13 +96,198 @@ export function registerTestingTools(server: McpServer, client: AppStoreConnectC
   );
 
   server.tool(
+    'get_beta_app_info',
+    'Get the beta app description, review contact info, and localization status for an app. Shows what\'s needed for TestFlight external testing.',
+    {
+      appId: z.string().describe('App resource ID (from list_apps)'),
+    },
+    async ({ appId }) => {
+      try {
+        const [localizations, reviewDetails] = await Promise.all([
+          client.requestAll(`/v1/apps/${appId}/betaAppLocalizations`, {
+            'fields[betaAppLocalizations]': 'description,feedbackEmail,marketingUrl,privacyPolicyUrl,locale',
+          }),
+          client.request<{ data: { id: string; attributes: Record<string, unknown> } }>(
+            `/v1/apps/${appId}/betaAppReviewDetail`
+          ),
+        ]);
+
+        const locs = (localizations as Array<{ id: string; attributes: Record<string, unknown> }>).map(l => ({
+          id: l.id,
+          ...l.attributes,
+        }));
+
+        const reviewAttrs = reviewDetails.data.attributes as Record<string, unknown>;
+        const review = { id: reviewDetails.data.id, ...reviewAttrs };
+
+        const issues: string[] = [];
+        if (locs.length === 0) issues.push('No beta app description set (required for external testing)');
+        else if (!locs.some((l: Record<string, unknown>) => l.description)) issues.push('Beta app description is empty');
+        if (!reviewAttrs.contactEmail) issues.push('Review contact email not set');
+        if (!reviewAttrs.contactFirstName) issues.push('Review contact first name not set');
+        if (!reviewAttrs.contactLastName) issues.push('Review contact last name not set');
+        if (!reviewAttrs.contactPhone) issues.push('Review contact phone not set');
+
+        const status = issues.length === 0 ? 'READY for external beta submission' : `${issues.length} issue(s) to fix before external beta submission`;
+
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `${status}\n${issues.length > 0 ? '\nIssues:\n' + issues.map(i => `  - ${i}`).join('\n') + '\n' : ''}\nLocalizations:\n${JSON.stringify(locs, null, 2)}\n\nReview Contact:\n${JSON.stringify(review, null, 2)}`,
+          }],
+        };
+      } catch (error) {
+        return formatError(error);
+      }
+    }
+  );
+
+  server.tool(
+    'update_beta_app_info',
+    'Set or update the beta app description and review contact info needed for TestFlight external testing submission.',
+    {
+      appId: z.string().describe('App resource ID (from list_apps)'),
+      description: z.string().optional().describe('Beta app description shown to testers in TestFlight'),
+      feedbackEmail: z.string().optional().describe('Email for tester feedback'),
+      locale: z.string().optional().describe('Locale for the description (default en-US)'),
+      contactEmail: z.string().optional().describe('Review contact email (only visible to Apple reviewers)'),
+      contactFirstName: z.string().optional().describe('Review contact first name'),
+      contactLastName: z.string().optional().describe('Review contact last name'),
+      contactPhone: z.string().optional().describe('Review contact phone with country code (e.g. "+18005551234")'),
+      notes: z.string().optional().describe('Notes for the beta review team'),
+      demoAccountRequired: z.boolean().optional().describe('Whether a demo account is needed to review'),
+      demoAccountName: z.string().optional().describe('Demo account username'),
+      demoAccountPassword: z.string().optional().describe('Demo account password'),
+    },
+    async ({ appId, description, feedbackEmail, locale, contactEmail, contactFirstName, contactLastName, contactPhone, notes, demoAccountRequired, demoAccountName, demoAccountPassword }) => {
+      try {
+        const results: string[] = [];
+        const loc = locale ?? 'en-US';
+
+        // Update or create beta app localization (description)
+        if (description !== undefined || feedbackEmail !== undefined) {
+          const existing = await client.requestAll(`/v1/apps/${appId}/betaAppLocalizations`, {
+            'fields[betaAppLocalizations]': 'locale',
+          }) as Array<{ id: string; attributes: { locale: string } }>;
+
+          const match = existing.find(l => l.attributes.locale === loc);
+
+          const locAttributes: Record<string, string> = {};
+          if (description !== undefined) locAttributes.description = description;
+          if (feedbackEmail !== undefined) locAttributes.feedbackEmail = feedbackEmail;
+
+          if (match) {
+            await client.request(`/v1/betaAppLocalizations/${match.id}`, {
+              method: 'PATCH',
+              body: {
+                data: {
+                  type: 'betaAppLocalizations',
+                  id: match.id,
+                  attributes: locAttributes,
+                },
+              },
+            });
+            results.push(`Updated beta app localization (${loc})`);
+          } else {
+            await client.request('/v1/betaAppLocalizations', {
+              method: 'POST',
+              body: {
+                data: {
+                  type: 'betaAppLocalizations',
+                  attributes: { locale: loc, ...locAttributes },
+                  relationships: {
+                    app: { data: { type: 'apps', id: appId } },
+                  },
+                },
+              },
+            });
+            results.push(`Created beta app localization (${loc})`);
+          }
+        }
+
+        // Update review contact details
+        const reviewAttrs: Record<string, unknown> = {};
+        if (contactEmail !== undefined) reviewAttrs.contactEmail = contactEmail;
+        if (contactFirstName !== undefined) reviewAttrs.contactFirstName = contactFirstName;
+        if (contactLastName !== undefined) reviewAttrs.contactLastName = contactLastName;
+        if (contactPhone !== undefined) reviewAttrs.contactPhone = contactPhone;
+        if (notes !== undefined) reviewAttrs.notes = notes;
+        if (demoAccountRequired !== undefined) reviewAttrs.demoAccountRequired = demoAccountRequired;
+        if (demoAccountName !== undefined) reviewAttrs.demoAccountName = demoAccountName;
+        if (demoAccountPassword !== undefined) reviewAttrs.demoAccountPassword = demoAccountPassword;
+
+        if (Object.keys(reviewAttrs).length > 0) {
+          await client.request(`/v1/betaAppReviewDetails/${appId}`, {
+            method: 'PATCH',
+            body: {
+              data: {
+                type: 'betaAppReviewDetails',
+                id: appId,
+                attributes: reviewAttrs,
+              },
+            },
+          });
+          results.push(`Updated beta review contact info (${Object.keys(reviewAttrs).join(', ')})`);
+        }
+
+        if (results.length === 0) {
+          return {
+            content: [{ type: 'text' as const, text: 'No fields provided to update. Provide at least one of: description, feedbackEmail, contactEmail, contactFirstName, contactLastName, contactPhone, notes.' }],
+            isError: true,
+          };
+        }
+
+        return { content: [{ type: 'text' as const, text: results.join('\n') }] };
+      } catch (error) {
+        return formatError(error);
+      }
+    }
+  );
+
+  server.tool(
     'submit_for_review',
-    'Submit a build for TestFlight external testing review. Internal testers do not require review.',
+    'Submit a build for TestFlight external testing review. Checks that beta description and review contact are set first. Internal testers do not require review.',
     {
       buildId: z.string().describe('Build resource ID (from list_builds)'),
+      appId: z.string().optional().describe('App resource ID — if provided, runs pre-checks for beta description and contact info'),
     },
-    async ({ buildId }) => {
+    async ({ buildId, appId }) => {
       try {
+        // Pre-check if appId is provided
+        if (appId) {
+          const issues: string[] = [];
+
+          const [localizations, reviewDetails] = await Promise.all([
+            client.requestAll(`/v1/apps/${appId}/betaAppLocalizations`, {
+              'fields[betaAppLocalizations]': 'description,locale',
+            }),
+            client.request<{ data: { attributes: Record<string, unknown> } }>(
+              `/v1/apps/${appId}/betaAppReviewDetail`
+            ),
+          ]);
+
+          const locs = localizations as Array<{ attributes: { description?: string } }>;
+          if (locs.length === 0 || !locs.some(l => l.attributes.description)) {
+            issues.push('Beta app description is missing — use update_beta_app_info to set it');
+          }
+
+          const attrs = reviewDetails.data.attributes;
+          if (!attrs.contactEmail) issues.push('Review contact email not set');
+          if (!attrs.contactFirstName) issues.push('Review contact first name not set');
+          if (!attrs.contactLastName) issues.push('Review contact last name not set');
+          if (!attrs.contactPhone) issues.push('Review contact phone not set');
+
+          if (issues.length > 0) {
+            return {
+              content: [{
+                type: 'text' as const,
+                text: `Cannot submit for beta review — ${issues.length} issue(s):\n${issues.map(i => `  - ${i}`).join('\n')}\n\nUse update_beta_app_info to fix these, then retry.`,
+              }],
+              isError: true,
+            };
+          }
+        }
+
         const body = {
           data: {
             type: 'betaAppReviewSubmissions',
