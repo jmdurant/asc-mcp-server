@@ -4,10 +4,16 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { loadConfig, getConfigErrors } from './config.js';
 
 const config = loadConfig();
+const errors = config ? [] : getConfigErrors();
 
 const server = new McpServer(
   { name: 'asc-mcp-server', version: '1.0.0' },
-  { capabilities: { logging: {} } }
+  {
+    capabilities: { logging: {} },
+    ...(!config && {
+      instructions: 'App Store Connect MCP Server — setup required. Run the "setup" tool for configuration instructions.',
+    }),
+  }
 );
 
 if (config) {
