@@ -5,6 +5,7 @@ import { promisify } from 'node:util';
 import type { AppStoreConnectClient } from '../client.js';
 import type { Config } from '../config.js';
 import { AppStoreConnectError, formatError } from '../errors.js';
+import { uploadBuildViaAPI } from '../upload.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -37,23 +38,36 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
 
   server.tool(
     'upload_build',
-    'Archive, export, and upload an Xcode project build to App Store Connect. Runs xcodebuild archive, export, and xcrun altool upload.',
+    'Archive, export, and upload an Xcode project build to App Store Connect via the Build Upload API. For watchOS: pass the iOS stub scheme (not the watchOS scheme) — the stub embeds the watchOS app and uploads as iOS platform.',
     {
       projectPath: z.string().describe('Absolute path to .xcodeproj file'),
-      scheme: z.string().describe('Xcode scheme name'),
-      destination: z.string().optional().describe('Build destination (default: "generic/platform=iOS")'),
+      scheme: z.string().describe('Xcode scheme name. For watchOS, use the iOS stub scheme (e.g. "MyApp-Stub") that embeds the watchOS app.'),
+      destination: z.string().optional().describe('Build destination (default: auto-detected from platformType)'),
       archivePath: z.string().optional().describe('Where to save the .xcarchive (default: /tmp/asc-build.xcarchive)'),
       exportOptionsPlist: z.string().optional().describe('Path to ExportOptions.plist (will create a default if not provided)'),
-      platformType: z.enum(['ios', 'macos', 'appletvos']).optional().describe('Platform type for altool upload (default: ios)'),
+      platformType: z.enum(['ios', 'macos', 'appletvos', 'watchos', 'visionos']).optional().describe('Platform type (default: ios). watchOS uploads via an iOS stub — destination is set to iOS automatically.'),
+      appId: z.string().optional().describe('ASC app resource ID (from list_apps). If not provided, auto-detected from bundle ID in the archive.'),
     },
-    async ({ projectPath, scheme, destination, archivePath, exportOptionsPlist, platformType }) => {
+    async ({ projectPath, scheme, destination, archivePath, exportOptionsPlist, platformType, appId }) => {
       try {
         const archive = archivePath ?? '/tmp/asc-build.xcarchive';
         const exportPath = '/tmp/asc-build-export';
-        const dest = destination ?? 'generic/platform=iOS';
         const type = platformType ?? 'ios';
 
-        // Pre-flight: extract bundle ID from the project and validate
+        const isWatchOS = type === 'watchos';
+
+        // Auto-detect destination from platform
+        // watchOS uploads via iOS stub, so destination is iOS
+        const destMap: Record<string, string> = {
+          ios: 'generic/platform=iOS',
+          macos: 'generic/platform=macOS',
+          appletvos: 'generic/platform=tvOS',
+          watchos: 'generic/platform=iOS',
+          visionos: 'generic/platform=visionOS',
+        };
+        const dest = destination ?? destMap[type] ?? 'generic/platform=iOS';
+
+        // Pre-flight: check project exists
         const { existsSync } = await import('node:fs');
         if (!existsSync(projectPath)) {
           return formatError(new Error(`Project not found: ${projectPath}`));
@@ -81,7 +95,6 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
         // Create default ExportOptions.plist if not provided
         let exportPlist = exportOptionsPlist;
         if (!exportPlist) {
-          // Auto-detect team ID from the API (seedId on any bundle ID)
           const bundleIds = await client.requestAll('/v1/bundleIds', { limit: '1' }) as Array<{ attributes: { seedId: string } }>;
           const teamId = bundleIds[0]?.attributes?.seedId;
           if (!teamId) {
@@ -90,12 +103,14 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
 
           exportPlist = '/tmp/asc-ExportOptions.plist';
           const { writeFileSync } = await import('node:fs');
+          // Use release-testing method — produces a signed IPA without uploading.
+          // We handle the upload ourselves via the Build Upload API.
           writeFileSync(exportPlist, `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>method</key>
-    <string>app-store-connect</string>
+    <string>release-testing</string>
     <key>teamID</key>
     <string>${teamId}</string>
     <key>signingStyle</key>
@@ -122,6 +137,98 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
         if (archiveErr.includes('ARCHIVE FAILED') || archiveOut.includes('ARCHIVE FAILED')) {
           const errorLines = (archiveOut + archiveErr).split('\n').filter(l => l.includes('error:'));
           return formatError(new Error(`Archive failed:\n${errorLines.join('\n')}`));
+        }
+
+        // Extract version info and bundle ID from the archive
+        let bundleShortVersion: string;
+        let bundleVersion: string;
+        let bundleId: string;
+        try {
+          const { stdout: sv } = await execFileAsync('plutil', [
+            '-extract', 'ApplicationProperties.CFBundleShortVersionString', 'raw', '-o', '-',
+            `${archive}/Info.plist`,
+          ]);
+          const { stdout: bv } = await execFileAsync('plutil', [
+            '-extract', 'ApplicationProperties.CFBundleVersion', 'raw', '-o', '-',
+            `${archive}/Info.plist`,
+          ]);
+          const { stdout: bi } = await execFileAsync('plutil', [
+            '-extract', 'ApplicationProperties.CFBundleIdentifier', 'raw', '-o', '-',
+            `${archive}/Info.plist`,
+          ]);
+          bundleShortVersion = sv.trim();
+          bundleVersion = bv.trim();
+          bundleId = bi.trim();
+        } catch {
+          return formatError(new Error(
+            'Failed to extract version info from archive. Ensure the archive was built correctly.'
+          ));
+        }
+
+        // watchOS post-archive validation
+        if (isWatchOS) {
+          const appPath = `${archive}/Products/Applications`;
+          const { readdirSync: readArchiveDir, existsSync: archiveExists } = await import('node:fs');
+
+          // Find the main .app in the archive
+          const appBundles = readArchiveDir(appPath).filter(f => f.endsWith('.app'));
+          if (appBundles.length === 0) {
+            return formatError(new Error(
+              'watchOS upload failed: No .app found in archive.\n' +
+              'Make sure the scheme is the iOS stub target (not the watchOS target).'
+            ));
+          }
+
+          // Check for embedded watchOS app inside Watch/ directory
+          const mainApp = appBundles[0];
+          const watchDir = `${appPath}/${mainApp}/Watch`;
+          if (!archiveExists(watchDir)) {
+            return formatError(new Error(
+              `watchOS upload failed: No Watch/ directory found in ${mainApp}.\n` +
+              'The iOS stub must embed the watchOS app as a dependency.\n' +
+              'In project.yml, add the watchOS target as a dependency of the stub target.'
+            ));
+          }
+          const watchApps = readArchiveDir(watchDir).filter(f => f.endsWith('.app'));
+          if (watchApps.length === 0) {
+            return formatError(new Error(
+              `watchOS upload failed: No watchOS .app found in ${mainApp}/Watch/.\n` +
+              'Verify the stub target has the watchOS target as a dependency.'
+            ));
+          }
+
+          // Check version consistency between stub and watchOS app
+          try {
+            const { stdout: watchVersion } = await execFileAsync('plutil', [
+              '-extract', 'CFBundleVersion', 'raw', '-o', '-',
+              `${watchDir}/${watchApps[0]}/Info.plist`,
+            ]);
+            if (watchVersion.trim() !== bundleVersion) {
+              // Warning, not a blocker — but log it
+              // Apple may issue a warning (90473) but won't reject for this
+            }
+
+            // Check for widget extension version mismatch
+            const pluginsDir = `${watchDir}/${watchApps[0]}/PlugIns`;
+            if (archiveExists(pluginsDir)) {
+              const extensions = readArchiveDir(pluginsDir).filter(f => f.endsWith('.appex'));
+              for (const ext of extensions) {
+                try {
+                  const { stdout: extVersion } = await execFileAsync('plutil', [
+                    '-extract', 'CFBundleVersion', 'raw', '-o', '-',
+                    `${pluginsDir}/${ext}/Info.plist`,
+                  ]);
+                  if (extVersion.trim() !== bundleVersion) {
+                    return formatError(new Error(
+                      `Version mismatch: Extension ${ext} has CFBundleVersion ${extVersion.trim()} ` +
+                      `but the stub has ${bundleVersion}.\n` +
+                      'Update CURRENT_PROJECT_VERSION to match across all targets in project.yml.'
+                    ));
+                  }
+                } catch { /* extension might not have CFBundleVersion — skip */ }
+              }
+            }
+          } catch { /* version extraction failed — continue anyway */ }
         }
 
         // Step 2: Export
@@ -153,24 +260,38 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
           return formatError(new Error(`No .ipa or .pkg found in export: ${files.join(', ')}`));
         }
 
-        // Step 3: Upload
-        const { stdout: uploadOut, stderr: uploadErr } = await execFileAsync('xcrun', [
-          'altool', '--upload-app',
-          '-f', `${exportPath}/${artifact}`,
-          '--apiKey', config.keyId,
-          '--apiIssuer', config.issuerId,
-          '--type', type,
-        ], { maxBuffer: 10 * 1024 * 1024, timeout: 600000 });
-
-        const output = uploadOut + uploadErr;
-        if (output.includes('Error') || output.includes('error')) {
-          return formatError(new Error(`Upload failed:\n${output}`));
+        // Resolve app ID if not provided
+        let resolvedAppId = appId;
+        if (!resolvedAppId) {
+          const apps = await client.requestAll('/v1/apps', {
+            'filter[bundleId]': bundleId,
+            'fields[apps]': 'bundleId',
+          }) as Array<{ id: string }>;
+          if (apps.length === 0) {
+            return formatError(new Error(
+              `No app found in ASC for bundle ID '${bundleId}'.\n` +
+              'Create the app in App Store Connect first, or provide the appId parameter.'
+            ));
+          }
+          resolvedAppId = apps[0].id;
         }
+
+        // Step 3: Upload via Build Upload API
+        const artifactPath = `${exportPath}/${artifact}`;
+        const result = await uploadBuildViaAPI(
+          client,
+          resolvedAppId,
+          artifactPath,
+          artifact,
+          type,
+          bundleShortVersion,
+          bundleVersion,
+        );
 
         return {
           content: [{
             type: 'text' as const,
-            text: `Build uploaded successfully!\nScheme: ${scheme}\nArtifact: ${artifact}\n\n${output}`,
+            text: `Build pipeline complete!\nScheme: ${scheme}\nBundle ID: ${bundleId}\nVersion: ${bundleShortVersion} (${bundleVersion})\nArtifact: ${artifact}\n\n${result}`,
           }],
         };
       } catch (error) {
