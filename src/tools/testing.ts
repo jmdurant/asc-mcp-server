@@ -319,9 +319,9 @@ export function registerTestingTools(server: McpServer, client: AppStoreConnectC
               // Fetch team users to auto-populate contact info
               try {
                 const users = await client.requestAll('/v1/users', {
-                  'fields[users]': 'firstName,lastName,email,roles',
+                  'fields[users]': 'firstName,lastName,username,roles',
                   'limit': '10',
-                }) as Array<{ attributes: { firstName: string; lastName: string; email: string; roles: string[] } }>;
+                }) as Array<{ attributes: { firstName: string; lastName: string; username: string; roles: string[] } }>;
 
                 // Prefer account holder or admin
                 const admin = users.find(u =>
@@ -331,8 +331,8 @@ export function registerTestingTools(server: McpServer, client: AppStoreConnectC
 
                 if (admin) {
                   if (!reviewAttrs.contactEmail) {
-                    updates.contactEmail = admin.attributes.email;
-                    autoFilled.push(`Contact email: ${admin.attributes.email} (from team)`);
+                    updates.contactEmail = admin.attributes.username;
+                    autoFilled.push(`Contact email: ${admin.attributes.username} (from team)`);
                   }
                   if (!reviewAttrs.contactFirstName) {
                     updates.contactFirstName = admin.attributes.firstName;
