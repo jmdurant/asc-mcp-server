@@ -26,6 +26,7 @@ if (config) {
   const { registerAgreementTools } = await import('./tools/agreements.js');
   const { registerDeviceTools } = await import('./tools/devices.js');
   const { registerProvisioningTools } = await import('./tools/provisioning.js');
+  const { registerAppStoreVersionTools } = await import('./tools/appStoreVersions.js');
 
   const client = new AppStoreConnectClient(config);
 
@@ -36,6 +37,7 @@ if (config) {
   registerAgreementTools(server, client);
   registerDeviceTools(server, client);
   registerProvisioningTools(server, client);
+  registerAppStoreVersionTools(server, client);
 } else {
   // Config is missing or invalid — register only the setup tool
   server.tool(
