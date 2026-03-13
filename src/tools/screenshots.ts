@@ -13,22 +13,22 @@ import { createHash } from 'node:crypto';
  */
 const DISPLAY_TYPES: Record<string, { description: string; simulatorMatch: string; width: number; height: number }> = {
   'APP_IPHONE_67': {
-    description: 'iPhone 6.7" (iPhone 15 Plus, 16 Plus)',
+    description: 'iPhone 6.7" (iPhone 14/15/16 Plus, 14/15 Pro Max)',
     simulatorMatch: 'iPhone Air',
     width: 1290,
     height: 2796,
   },
-  'APP_IPHONE_61': {
-    description: 'iPhone 6.1" (iPhone 15, 16)',
+  'APP_IPHONE_65': {
+    description: 'iPhone 6.5" (iPhone 11/12/13 Pro Max)',
     simulatorMatch: 'iPhone 17',
+    width: 1284,
+    height: 2778,
+  },
+  'APP_IPHONE_61': {
+    description: 'iPhone 6.1" (iPhone 12/13/14/15)',
+    simulatorMatch: 'iPhone 16e',
     width: 1179,
     height: 2556,
-  },
-  'APP_IPHONE_69': {
-    description: 'iPhone 6.9" (iPhone 16 Pro Max)',
-    simulatorMatch: 'iPhone 17 Pro Max',
-    width: 1320,
-    height: 2868,
   },
   'APP_IPAD_PRO_3GEN_129': {
     description: 'iPad Pro 12.9" (3rd gen+)',
@@ -363,8 +363,8 @@ export function registerScreenshotTools(server: McpServer, client: AppStoreConne
                 type: 'appScreenshots',
                 id: screenshotId,
                 attributes: {
-                  uploaded: true,
-                  sourceFileChecksum: { value: checksum },
+                  isUploaded: true,
+                  sourceFileChecksum: checksum,
                 },
               },
             };
