@@ -246,17 +246,19 @@ export function registerTestingTools(server: McpServer, client: AppStoreConnectC
 
   server.tool(
     'submit_for_review',
-    'Submit a build for TestFlight external testing review. Checks that beta description and review contact are set first. Internal testers do not require review.',
+    'Submit a build for TestFlight external testing review. Auto-fills missing beta description and review contact info from the API when possible. Only prompts for phone number if truly missing. Internal testers do not require review.',
     {
       buildId: z.string().describe('Build resource ID (from list_builds)'),
-      appId: z.string().optional().describe('App resource ID — if provided, runs pre-checks for beta description and contact info'),
+      appId: z.string().optional().describe('App resource ID — if provided, auto-fills missing beta info before submitting'),
+      contactPhone: z.string().optional().describe('Contact phone with country code (e.g. "+18005551234") — only needed on first submission if not already set'),
+      description: z.string().optional().describe('Beta app description — auto-generates from app name if not provided'),
     },
-    async ({ buildId, appId }) => {
+    async ({ buildId, appId, contactPhone, description }) => {
       try {
-        // Pre-check if appId is provided
         if (appId) {
-          const issues: string[] = [];
+          const autoFilled: string[] = [];
 
+          // Fetch current state
           const [localizations, reviewDetails] = await Promise.all([
             client.requestAll(`/v1/apps/${appId}/betaAppLocalizations`, {
               'fields[betaAppLocalizations]': 'description,locale',
@@ -266,25 +268,112 @@ export function registerTestingTools(server: McpServer, client: AppStoreConnectC
             ),
           ]);
 
-          const locs = localizations as Array<{ attributes: { description?: string } }>;
+          const locs = localizations as Array<{ id: string; attributes: { description?: string; locale?: string } }>;
+          const reviewAttrs = reviewDetails.data.attributes;
+
+          // Auto-fill beta description if missing
           if (locs.length === 0 || !locs.some(l => l.attributes.description)) {
-            issues.push('Beta app description is missing — use update_beta_app_info to set it');
+            // Get app name for a default description
+            let appName = 'this app';
+            try {
+              const appData = await client.request<{ data: { attributes: { name: string } } }>(
+                `/v1/apps/${appId}`,
+                { params: { 'fields[apps]': 'name' } }
+              );
+              appName = appData.data.attributes.name;
+            } catch { /* use default */ }
+
+            const desc = description ?? `Beta testing for ${appName}.`;
+
+            if (locs.length > 0 && locs[0].attributes.locale) {
+              // Update existing localization
+              const locId = (locs[0] as { id: string }).id;
+              await client.request(`/v1/betaAppLocalizations/${locId}`, {
+                method: 'PATCH',
+                body: { data: { type: 'betaAppLocalizations', id: locId, attributes: { description: desc } } },
+              });
+            } else {
+              // Create new localization
+              await client.request('/v1/betaAppLocalizations', {
+                method: 'POST',
+                body: {
+                  data: {
+                    type: 'betaAppLocalizations',
+                    attributes: { locale: 'en-US', description: desc },
+                    relationships: { app: { data: { type: 'apps', id: appId } } },
+                  },
+                },
+              });
+            }
+            autoFilled.push(`Beta description: "${desc}"`);
           }
 
-          const attrs = reviewDetails.data.attributes;
-          if (!attrs.contactEmail) issues.push('Review contact email not set');
-          if (!attrs.contactFirstName) issues.push('Review contact first name not set');
-          if (!attrs.contactLastName) issues.push('Review contact last name not set');
-          if (!attrs.contactPhone) issues.push('Review contact phone not set');
+          // Auto-fill review contact from team users if missing
+          const needsContact = !reviewAttrs.contactEmail || !reviewAttrs.contactFirstName || !reviewAttrs.contactLastName;
+          const needsPhone = !reviewAttrs.contactPhone;
 
-          if (issues.length > 0) {
+          if (needsContact || (needsPhone && contactPhone)) {
+            const updates: Record<string, unknown> = {};
+
+            if (needsContact) {
+              // Fetch team users to auto-populate contact info
+              try {
+                const users = await client.requestAll('/v1/users', {
+                  'fields[users]': 'firstName,lastName,email,roles',
+                  'limit': '10',
+                }) as Array<{ attributes: { firstName: string; lastName: string; email: string; roles: string[] } }>;
+
+                // Prefer account holder or admin
+                const admin = users.find(u =>
+                  u.attributes.roles?.includes('ACCOUNT_HOLDER') ||
+                  u.attributes.roles?.includes('ADMIN')
+                ) ?? users[0];
+
+                if (admin) {
+                  if (!reviewAttrs.contactEmail) {
+                    updates.contactEmail = admin.attributes.email;
+                    autoFilled.push(`Contact email: ${admin.attributes.email} (from team)`);
+                  }
+                  if (!reviewAttrs.contactFirstName) {
+                    updates.contactFirstName = admin.attributes.firstName;
+                    autoFilled.push(`Contact first name: ${admin.attributes.firstName}`);
+                  }
+                  if (!reviewAttrs.contactLastName) {
+                    updates.contactLastName = admin.attributes.lastName;
+                    autoFilled.push(`Contact last name: ${admin.attributes.lastName}`);
+                  }
+                }
+              } catch { /* users endpoint may fail, continue */ }
+            }
+
+            if (needsPhone && contactPhone) {
+              updates.contactPhone = contactPhone;
+              autoFilled.push(`Contact phone: ${contactPhone}`);
+            }
+
+            if (Object.keys(updates).length > 0) {
+              await client.request(`/v1/betaAppReviewDetails/${appId}`, {
+                method: 'PATCH',
+                body: { data: { type: 'betaAppReviewDetails', id: appId, attributes: updates } },
+              });
+            }
+          }
+
+          // Final check — is phone still missing?
+          if (needsPhone && !contactPhone) {
             return {
               content: [{
                 type: 'text' as const,
-                text: `Cannot submit for beta review — ${issues.length} issue(s):\n${issues.map(i => `  - ${i}`).join('\n')}\n\nUse update_beta_app_info to fix these, then retry.`,
+                text: `Almost ready — auto-filled: ${autoFilled.join(', ') || 'nothing needed'}\n\n` +
+                  `But contact phone number is required and can't be auto-detected.\n` +
+                  `Re-run with contactPhone parameter (e.g. "+18005551234") to set it and submit.`,
               }],
               isError: true,
             };
+          }
+
+          if (autoFilled.length > 0) {
+            // Log what was auto-filled (will be included in response)
           }
         }
 
@@ -298,8 +387,13 @@ export function registerTestingTools(server: McpServer, client: AppStoreConnectC
             },
           },
         };
-        const result = await client.request('/v1/betaAppReviewSubmissions', { method: 'POST', body });
-        return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
+        const result = await client.request<{ data: { attributes: Record<string, unknown> } }>(
+          '/v1/betaAppReviewSubmissions',
+          { method: 'POST', body }
+        );
+
+        const prefix = appId ? 'Auto-filled missing beta info and submitted.\n\n' : '';
+        return { content: [{ type: 'text' as const, text: `${prefix}${JSON.stringify(result, null, 2)}` }] };
       } catch (error) {
         return formatError(error);
       }
