@@ -7,19 +7,72 @@ export interface Config {
   keyPath: string;
 }
 
-export function loadConfig(): Config {
+export interface ConfigError {
+  variable: string;
+  description: string;
+  present: boolean;
+  error?: string;
+}
+
+export function getConfigErrors(): ConfigError[] {
+  const errors: ConfigError[] = [];
+
   const keyId = process.env.ASC_KEY_ID;
+  errors.push({
+    variable: 'ASC_KEY_ID',
+    description: 'Your API Key ID',
+    present: !!keyId,
+    ...(!keyId ? { error: 'Not set' } : {}),
+  });
+
   const issuerId = process.env.ASC_ISSUER_ID;
+  errors.push({
+    variable: 'ASC_ISSUER_ID',
+    description: 'Your Issuer ID',
+    present: !!issuerId,
+    ...(!issuerId ? { error: 'Not set' } : {}),
+  });
+
   const keyPath = process.env.ASC_KEY_PATH;
-
-  if (!keyId) throw new Error('ASC_KEY_ID environment variable is required');
-  if (!issuerId) throw new Error('ASC_ISSUER_ID environment variable is required');
-  if (!keyPath) throw new Error('ASC_KEY_PATH environment variable is required');
-
-  const resolvedPath = resolve(keyPath);
-  if (!existsSync(resolvedPath)) {
-    throw new Error(`API key file not found: ${resolvedPath}`);
+  if (!keyPath) {
+    errors.push({
+      variable: 'ASC_KEY_PATH',
+      description: '/path/to/AuthKey_XXXXXX.p8',
+      present: false,
+      error: 'Not set',
+    });
+  } else {
+    const resolvedPath = resolve(keyPath);
+    if (!existsSync(resolvedPath)) {
+      errors.push({
+        variable: 'ASC_KEY_PATH',
+        description: '/path/to/AuthKey_XXXXXX.p8',
+        present: true,
+        error: `File not found: ${resolvedPath}`,
+      });
+    } else {
+      errors.push({
+        variable: 'ASC_KEY_PATH',
+        description: '/path/to/AuthKey_XXXXXX.p8',
+        present: true,
+      });
+    }
   }
 
-  return { keyId, issuerId, keyPath: resolvedPath };
+  return errors;
+}
+
+export function loadConfig(): Config | null {
+  const errors = getConfigErrors();
+  const hasErrors = errors.some(e => !!e.error);
+
+  if (hasErrors) {
+    return null;
+  }
+
+  return {
+    keyId: process.env.ASC_KEY_ID!,
+    issuerId: process.env.ASC_ISSUER_ID!,
+    keyPath: resolve(process.env.ASC_KEY_PATH!),
+  };
 }
