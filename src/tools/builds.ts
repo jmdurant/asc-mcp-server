@@ -302,11 +302,12 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
 
   server.tool(
     'preflight',
-    'Validate that everything is ready for a build upload: bundle ID registered, app created in ASC, distribution certificate valid, and team ID detectable. Run this before upload_build to catch issues early.',
+    'Validate that everything is ready for a build upload: bundle ID registered, app created in ASC, distribution certificate valid, team ID detectable, and export compliance key set. Run this before upload_build to catch issues early.',
     {
       bundleId: z.string().describe('The bundle identifier to check (e.g. "com.example.myapp")'),
+      projectPath: z.string().optional().describe('Absolute path to .xcodeproj — if provided, checks Info.plist for ITSAppUsesNonExemptEncryption key'),
     },
-    async ({ bundleId }) => {
+    async ({ bundleId, projectPath }) => {
       const issues: string[] = [];
       const ok: string[] = [];
 
@@ -398,6 +399,59 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
       } catch (error) {
         if (error instanceof AppStoreConnectError && error.status === 403) {
           issues.push('ASC agreements not accepted. Visit App Store Connect to accept pending agreements.');
+        }
+      }
+
+      // 5. Check export compliance key in Info.plist
+      if (projectPath) {
+        try {
+          const { existsSync: projExists, readdirSync: readDir, readFileSync } = await import('node:fs');
+          const { dirname, join } = await import('node:path');
+          const projectDir = dirname(projectPath);
+
+          // Look for Info.plist files in the project directory
+          const findPlists = (dir: string): string[] => {
+            const results: string[] = [];
+            try {
+              for (const entry of readDir(dir, { withFileTypes: true })) {
+                if (entry.name === 'Info.plist' && entry.isFile()) {
+                  results.push(join(dir, entry.name));
+                } else if (entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'Pods' && entry.name !== 'build' && !entry.name.endsWith('.xcodeproj') && !entry.name.endsWith('.xcworkspace')) {
+                  results.push(...findPlists(join(dir, entry.name)));
+                }
+              }
+            } catch { /* skip unreadable dirs */ }
+            return results;
+          };
+
+          const plists = findPlists(projectDir);
+          const missingKey: string[] = [];
+
+          for (const plist of plists) {
+            try {
+              const content = readFileSync(plist, 'utf8');
+              // Only check app plists (not extension plists in PlugIns, etc.)
+              if (content.includes('CFBundlePackageType') && content.includes('APPL')) {
+                if (!content.includes('ITSAppUsesNonExemptEncryption')) {
+                  const relative = plist.replace(projectDir + '/', '');
+                  missingKey.push(relative);
+                }
+              }
+            } catch { /* skip unreadable files */ }
+          }
+
+          if (missingKey.length > 0) {
+            issues.push(
+              `Missing ITSAppUsesNonExemptEncryption in Info.plist:\n` +
+              missingKey.map(p => `   → ${p}`).join('\n') + '\n' +
+              '   Add <key>ITSAppUsesNonExemptEncryption</key><false/> to skip the export compliance prompt.\n' +
+              '   Set to <true/> only if your app uses custom (non-Apple) encryption.'
+            );
+          } else if (plists.length > 0) {
+            ok.push('Export compliance: ITSAppUsesNonExemptEncryption set in all app Info.plists');
+          }
+        } catch {
+          // Non-fatal — just skip this check
         }
       }
 
