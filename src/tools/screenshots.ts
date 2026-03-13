@@ -417,4 +417,22 @@ export function registerScreenshotTools(server: McpServer, client: AppStoreConne
       }
     }
   );
+
+  server.tool(
+    'delete_screenshot',
+    'Delete a screenshot from App Store Connect by its resource ID',
+    {
+      screenshotId: z.string().describe('App screenshot resource ID (from list_screenshot_sets or upload_screenshots)'),
+    },
+    async ({ screenshotId }) => {
+      try {
+        await client.request(`/v1/appScreenshots/${screenshotId}`, {
+          method: 'DELETE',
+        });
+        return { content: [{ type: 'text' as const, text: `Deleted screenshot ${screenshotId}.` }] };
+      } catch (error) {
+        return formatError(error);
+      }
+    }
+  );
 }
