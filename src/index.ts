@@ -35,7 +35,7 @@ if (config) {
   registerAppTools(server, client);
   registerBundleIdTools(server, client);
   registerBuildTools(server, client, config);
-  registerTestingTools(server, client);
+  registerTestingTools(server, client, config);
   registerAgreementTools(server, client);
   registerDeviceTools(server, client);
   registerProvisioningTools(server, client);
@@ -53,7 +53,8 @@ if (config) {
       const missing = errors.filter(e => !!e.error);
       const set = errors.filter(e => !e.error);
 
-      const envBlock = errors.map(e => `    "${e.variable}": "${e.description}"`).join(',\n');
+      const envBlock = errors.map(e => `    "${e.variable}": "${e.description}"`).join(',\n') +
+        ',\n    "ASC_CONTACT_PHONE": "+1XXXXXXXXXX (optional — for TestFlight beta review contact)"';
 
       let statusLines = '';
       if (set.length > 0) {

@@ -1,9 +1,10 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { AppStoreConnectClient } from '../client.js';
+import type { Config } from '../config.js';
 import { formatError } from '../errors.js';
 
-export function registerTestingTools(server: McpServer, client: AppStoreConnectClient) {
+export function registerTestingTools(server: McpServer, client: AppStoreConnectClient, config: Config) {
   server.tool(
     'list_testers',
     'List TestFlight beta testers',
@@ -250,11 +251,14 @@ export function registerTestingTools(server: McpServer, client: AppStoreConnectC
     {
       buildId: z.string().describe('Build resource ID (from list_builds)'),
       appId: z.string().optional().describe('App resource ID — if provided, auto-fills missing beta info before submitting'),
-      contactPhone: z.string().optional().describe('Contact phone with country code (e.g. "+18005551234") — only needed on first submission if not already set'),
+      contactPhone: z.string().optional().describe('Contact phone with country code (e.g. "+18005551234") — falls back to ASC_CONTACT_PHONE env var if not provided'),
       description: z.string().optional().describe('Beta app description — auto-generates from app name if not provided'),
     },
     async ({ buildId, appId, contactPhone, description }) => {
       try {
+        // Fall back to config phone if not provided as parameter
+        const phone = contactPhone ?? config.contactPhone;
+
         if (appId) {
           const autoFilled: string[] = [];
 
@@ -312,7 +316,7 @@ export function registerTestingTools(server: McpServer, client: AppStoreConnectC
           const needsContact = !reviewAttrs.contactEmail || !reviewAttrs.contactFirstName || !reviewAttrs.contactLastName;
           const needsPhone = !reviewAttrs.contactPhone;
 
-          if (needsContact || (needsPhone && contactPhone)) {
+          if (needsContact || (needsPhone && phone)) {
             const updates: Record<string, unknown> = {};
 
             if (needsContact) {
@@ -346,9 +350,9 @@ export function registerTestingTools(server: McpServer, client: AppStoreConnectC
               } catch { /* users endpoint may fail, continue */ }
             }
 
-            if (needsPhone && contactPhone) {
-              updates.contactPhone = contactPhone;
-              autoFilled.push(`Contact phone: ${contactPhone}`);
+            if (needsPhone && phone) {
+              updates.contactPhone = phone;
+              autoFilled.push(`Contact phone: ${phone}${!contactPhone ? ' (from config)' : ''}`);
             }
 
             if (Object.keys(updates).length > 0) {
@@ -360,13 +364,13 @@ export function registerTestingTools(server: McpServer, client: AppStoreConnectC
           }
 
           // Final check — is phone still missing?
-          if (needsPhone && !contactPhone) {
+          if (needsPhone && !phone) {
             return {
               content: [{
                 type: 'text' as const,
                 text: `Almost ready — auto-filled: ${autoFilled.join(', ') || 'nothing needed'}\n\n` +
                   `But contact phone number is required and can't be auto-detected.\n` +
-                  `Re-run with contactPhone parameter (e.g. "+18005551234") to set it and submit.`,
+                  `Either re-run with contactPhone parameter (e.g. "+18005551234"), or add ASC_CONTACT_PHONE to your MCP server env config.`,
               }],
               isError: true,
             };

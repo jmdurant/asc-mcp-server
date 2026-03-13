@@ -5,6 +5,7 @@ export interface Config {
   keyId: string;
   issuerId: string;
   keyPath: string;
+  contactPhone?: string;
 }
 
 export interface ConfigError {
@@ -74,5 +75,6 @@ export function loadConfig(): Config | null {
     keyId: process.env.ASC_KEY_ID!,
     issuerId: process.env.ASC_ISSUER_ID!,
     keyPath: resolve(process.env.ASC_KEY_PATH!),
+    contactPhone: process.env.ASC_CONTACT_PHONE,
   };
 }
