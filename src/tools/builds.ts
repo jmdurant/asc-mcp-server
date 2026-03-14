@@ -38,23 +38,26 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
 
   server.tool(
     'upload_build',
-    'Archive, export, and upload an Xcode project build to App Store Connect via the Build Upload API. For watchOS: pass the iOS stub scheme (not the watchOS scheme) — the stub embeds the watchOS app and uploads as iOS platform.',
+    'Archive, export, and upload an Xcode project build to App Store Connect via the Build Upload API. Automatically increments the build number if the current one has already been uploaded. For watchOS: pass the iOS stub scheme (not the watchOS scheme) — the stub embeds the watchOS app and uploads as iOS platform.',
     {
-      projectPath: z.string().describe('Absolute path to .xcodeproj file'),
+      projectPath: z.string().describe('Absolute path to .xcodeproj or .xcworkspace file'),
       scheme: z.string().describe('Xcode scheme name. For watchOS, use the iOS stub scheme (e.g. "MyApp-Stub") that embeds the watchOS app.'),
       destination: z.string().optional().describe('Build destination (default: auto-detected from platformType)'),
       archivePath: z.string().optional().describe('Where to save the .xcarchive (default: /tmp/asc-build.xcarchive)'),
       exportOptionsPlist: z.string().optional().describe('Path to ExportOptions.plist (will create a default if not provided)'),
       platformType: z.enum(['ios', 'macos', 'appletvos', 'watchos', 'visionos']).optional().describe('Platform type (default: ios). watchOS uploads via an iOS stub — destination is set to iOS automatically.'),
       appId: z.string().optional().describe('ASC app resource ID (from list_apps). If not provided, auto-detected from bundle ID in the archive.'),
+      autoIncrementBuildNumber: z.boolean().optional().describe('Automatically increment build number if it conflicts with an existing upload (default: true)'),
     },
-    async ({ projectPath, scheme, destination, archivePath, exportOptionsPlist, platformType, appId }) => {
+    async ({ projectPath, scheme, destination, archivePath, exportOptionsPlist, platformType, appId, autoIncrementBuildNumber }) => {
       try {
         const archive = archivePath ?? '/tmp/asc-build.xcarchive';
         const exportPath = '/tmp/asc-build-export';
         const type = platformType ?? 'ios';
 
         const isWatchOS = type === 'watchos';
+        const isWorkspace = projectPath.endsWith('.xcworkspace');
+        const projectFlag = isWorkspace ? '-workspace' : '-project';
 
         // Auto-detect destination from platform
         // watchOS uploads via iOS stub, so destination is iOS
@@ -121,10 +124,62 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
 </plist>`);
         }
 
+        // Auto-increment build number if needed
+        let buildNumberOverride: string | undefined;
+        if (autoIncrementBuildNumber !== false) {
+          try {
+            // Get current build settings from the project
+            const { stdout: settingsOut } = await execFileAsync('xcodebuild', [
+              projectFlag, projectPath,
+              '-scheme', scheme,
+              '-showBuildSettings',
+            ], { maxBuffer: 10 * 1024 * 1024, timeout: 60000 });
+
+            const currentBuildNum = settingsOut.match(/CURRENT_PROJECT_VERSION = (.+)/)?.[1]?.trim();
+            const currentBundleId = settingsOut.match(/PRODUCT_BUNDLE_IDENTIFIER = (.+)/)?.[1]?.trim();
+
+            if (currentBundleId) {
+              // Resolve app ID from bundle ID if not provided
+              let checkAppId = appId;
+              if (!checkAppId) {
+                const apps = await client.requestAll('/v1/apps', {
+                  'filter[bundleId]': currentBundleId,
+                  'fields[apps]': 'bundleId',
+                }) as Array<{ id: string }>;
+                checkAppId = apps[0]?.id;
+              }
+
+              if (checkAppId) {
+                // Get existing builds sorted by most recent
+                const existingBuilds = await client.requestAll('/v1/builds', {
+                  'filter[app]': checkAppId,
+                  'fields[builds]': 'version',
+                  'sort': '-uploadedDate',
+                  'limit': '200',
+                }) as Array<{ id: string; attributes: { version: string } }>;
+
+                if (existingBuilds.length > 0) {
+                  const buildNumbers = existingBuilds
+                    .map(b => parseInt(b.attributes.version, 10))
+                    .filter(n => !isNaN(n));
+                  const maxExisting = Math.max(...buildNumbers);
+                  const currentNum = parseInt(currentBuildNum ?? '0', 10);
+
+                  if (!isNaN(maxExisting) && currentNum <= maxExisting) {
+                    buildNumberOverride = String(maxExisting + 1);
+                  }
+                }
+              }
+            }
+          } catch {
+            // Non-fatal — proceed with current build number
+          }
+        }
+
         // Step 1: Archive
-        const { stdout: archiveOut, stderr: archiveErr } = await execFileAsync('xcodebuild', [
+        const archiveArgs = [
           'archive',
-          '-project', projectPath,
+          projectFlag, projectPath,
           '-scheme', scheme,
           '-destination', dest,
           '-archivePath', archive,
@@ -132,7 +187,17 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
           '-authenticationKeyPath', config.keyPath,
           '-authenticationKeyID', config.keyId,
           '-authenticationKeyIssuerID', config.issuerId,
-        ], { maxBuffer: 50 * 1024 * 1024, timeout: 600000 });
+        ];
+        // Override build number for all targets in this archive if auto-incremented
+        if (buildNumberOverride) {
+          archiveArgs.push(`CURRENT_PROJECT_VERSION=${buildNumberOverride}`);
+          // Also set FLUTTER_BUILD_NUMBER for Flutter projects
+          archiveArgs.push(`FLUTTER_BUILD_NUMBER=${buildNumberOverride}`);
+        }
+
+        const { stdout: archiveOut, stderr: archiveErr } = await execFileAsync('xcodebuild',
+          archiveArgs,
+          { maxBuffer: 50 * 1024 * 1024, timeout: 600000 });
 
         if (archiveErr.includes('ARCHIVE FAILED') || archiveOut.includes('ARCHIVE FAILED')) {
           const errorLines = (archiveOut + archiveErr).split('\n').filter(l => l.includes('error:'));
@@ -288,10 +353,14 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
           bundleVersion,
         );
 
+        const incrementNote = buildNumberOverride
+          ? `\nBuild number auto-incremented: ${buildNumberOverride} (was ${bundleVersion} in project)`
+          : '';
+
         return {
           content: [{
             type: 'text' as const,
-            text: `Build pipeline complete!\nScheme: ${scheme}\nBundle ID: ${bundleId}\nVersion: ${bundleShortVersion} (${bundleVersion})\nArtifact: ${artifact}\n\n${result}`,
+            text: `Build pipeline complete!\nScheme: ${scheme}\nBundle ID: ${bundleId}\nVersion: ${bundleShortVersion} (${bundleVersion})${incrementNote}\nArtifact: ${artifact}\n\n${result}`,
           }],
         };
       } catch (error) {
@@ -449,6 +518,128 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
             );
           } else if (plists.length > 0) {
             ok.push('Export compliance: ITSAppUsesNonExemptEncryption set in all app Info.plists');
+          }
+        } catch {
+          // Non-fatal — just skip this check
+        }
+      }
+
+      // 6. Check common privacy usage descriptions in app Info.plists
+      if (projectPath) {
+        try {
+          const { readdirSync: readDirPriv, readFileSync: readFilePriv } = await import('node:fs');
+          const { dirname: dirnamePriv, join: joinPriv } = await import('node:path');
+          const projectDirPriv = dirnamePriv(projectPath);
+
+          // Common keys Apple rejects for — only warn if the app links the related framework
+          const privacyKeys: Array<{ key: string; label: string }> = [
+            { key: 'NSBluetoothAlwaysUsageDescription', label: 'Bluetooth' },
+            { key: 'NSBluetoothPeripheralUsageDescription', label: 'Bluetooth Peripheral' },
+            { key: 'NSSpeechRecognitionUsageDescription', label: 'Speech Recognition' },
+            { key: 'NSHomeKitUsageDescription', label: 'HomeKit' },
+            { key: 'NSFaceIDUsageDescription', label: 'Face ID' },
+            { key: 'NSLocationWhenInUseUsageDescription', label: 'Location' },
+            { key: 'NSCameraUsageDescription', label: 'Camera' },
+            { key: 'NSMicrophoneUsageDescription', label: 'Microphone' },
+            { key: 'NSPhotoLibraryUsageDescription', label: 'Photo Library' },
+          ];
+
+          const findAppPlists = (dir: string): string[] => {
+            const results: string[] = [];
+            try {
+              for (const entry of readDirPriv(dir, { withFileTypes: true })) {
+                if (entry.name === 'Info.plist' && entry.isFile()) {
+                  results.push(joinPriv(dir, entry.name));
+                } else if (entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'Pods' && entry.name !== 'build' && !entry.name.endsWith('.xcodeproj') && !entry.name.endsWith('.xcworkspace')) {
+                  results.push(...findAppPlists(joinPriv(dir, entry.name)));
+                }
+              }
+            } catch { /* skip */ }
+            return results;
+          };
+
+          const appPlists = findAppPlists(projectDirPriv)
+            .filter(p => {
+              try {
+                const c = readFilePriv(p, 'utf8');
+                return c.includes('CFBundlePackageType') && c.includes('APPL');
+              } catch { return false; }
+            });
+
+          if (appPlists.length > 0) {
+            // Read the main app plist (first one found)
+            const mainContent = readFilePriv(appPlists[0], 'utf8');
+            const missing = privacyKeys.filter(pk => !mainContent.includes(pk.key));
+            if (missing.length > 0) {
+              ok.push(`Privacy usage descriptions: ${privacyKeys.length - missing.length}/${privacyKeys.length} common keys present. Missing: ${missing.map(m => m.label).join(', ')}`);
+            } else {
+              ok.push(`Privacy usage descriptions: all ${privacyKeys.length} common keys present`);
+            }
+          }
+        } catch {
+          // Non-fatal
+        }
+      }
+
+      // 7. Check app icon asset catalog
+      if (projectPath) {
+        try {
+          const { readdirSync: readDir6, readFileSync: readFile6 } = await import('node:fs');
+          const { dirname: dirname6, join: join6 } = await import('node:path');
+          const projectDir6 = dirname6(projectPath);
+
+          // Recursively find all AppIcon.appiconset/Contents.json files
+          const findAppIcons = (dir: string): string[] => {
+            const results: string[] = [];
+            try {
+              for (const entry of readDir6(dir, { withFileTypes: true })) {
+                if (entry.isDirectory()) {
+                  if (entry.name === 'AppIcon.appiconset') {
+                    const contentsPath = join6(dir, entry.name, 'Contents.json');
+                    results.push(contentsPath);
+                  } else if (!entry.name.startsWith('.') && entry.name !== 'Pods' && entry.name !== 'build' && entry.name !== 'node_modules' && !entry.name.endsWith('.xcodeproj') && !entry.name.endsWith('.xcworkspace')) {
+                    results.push(...findAppIcons(join6(dir, entry.name)));
+                  }
+                }
+              }
+            } catch { /* skip unreadable dirs */ }
+            return results;
+          };
+
+          const iconPaths = findAppIcons(projectDir6);
+
+          if (iconPaths.length === 0) {
+            issues.push('No AppIcon asset catalog found');
+          } else {
+            const missingIcons: string[] = [];
+            for (const iconPath of iconPaths) {
+              try {
+                const contents = JSON.parse(readFile6(iconPath, 'utf8')) as { images?: Array<{ filename?: string; size?: string; scale?: string; idiom?: string }> };
+                if (contents.images) {
+                  const missing = contents.images.filter(img => !img.filename || img.filename.trim() === '');
+                  if (missing.length > 0) {
+                    const sizes = missing.map(img => {
+                      const parts: string[] = [];
+                      if (img.size) parts.push(img.size);
+                      if (img.scale) parts.push(`@${img.scale}`);
+                      if (img.idiom) parts.push(`(${img.idiom})`);
+                      return parts.join(' ') || 'unknown size';
+                    });
+                    const relative = iconPath.replace(projectDir6 + '/', '');
+                    missingIcons.push(`${relative}: missing ${missing.length} icon(s) — ${sizes.join(', ')}`);
+                  }
+                }
+              } catch { /* skip unreadable/invalid JSON */ }
+            }
+
+            if (missingIcons.length > 0) {
+              issues.push(
+                `App icon entries missing filenames:\n` +
+                missingIcons.map(m => `   → ${m}`).join('\n')
+              );
+            } else {
+              ok.push(`App icon: all icon entries have filenames (${iconPaths.length} asset catalog(s) found)`);
+            }
           }
         } catch {
           // Non-fatal — just skip this check
