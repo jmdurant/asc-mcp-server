@@ -30,6 +30,7 @@ if (config) {
   const { registerScreenshotTools } = await import('./tools/screenshots.js');
   const { registerReviewTools } = await import('./tools/reviews.js');
   const { registerDeployTools } = await import('./tools/deploy.js');
+  const { registerAnalyticsTools } = await import('./tools/analytics.js');
 
   const client = new AppStoreConnectClient(config);
 
@@ -44,6 +45,7 @@ if (config) {
   registerScreenshotTools(server, client);
   registerReviewTools(server, client);
   registerDeployTools(server, client, config);
+  registerAnalyticsTools(server, client);
 } else {
   // Config is missing or invalid — register only the setup tool
   server.tool(

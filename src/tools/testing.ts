@@ -98,6 +98,154 @@ export function registerTestingTools(server: McpServer, client: AppStoreConnectC
   );
 
   server.tool(
+    'remove_tester',
+    'Remove a beta tester from a TestFlight group',
+    {
+      betaGroupId: z.string().describe('Beta group resource ID'),
+      testerId: z.string().describe('Beta tester resource ID (from list_testers)'),
+    },
+    async ({ betaGroupId, testerId }) => {
+      try {
+        await client.request(
+          `/v1/betaGroups/${betaGroupId}/relationships/betaTesters`,
+          {
+            method: 'DELETE',
+            body: {
+              data: [{ type: 'betaTesters', id: testerId }],
+            },
+          }
+        );
+        return { content: [{ type: 'text' as const, text: `Tester ${testerId} removed from group ${betaGroupId}.` }] };
+      } catch (error) {
+        return formatError(error);
+      }
+    }
+  );
+
+  server.tool(
+    'list_beta_groups',
+    'List TestFlight beta testing groups for an app',
+    {
+      appId: z.string().describe('App resource ID (from list_apps)'),
+    },
+    async ({ appId }) => {
+      try {
+        const data = await client.requestAll(
+          `/v1/apps/${appId}/betaGroups`,
+          {
+            'fields[betaGroups]': 'name,isInternalGroup,publicLinkEnabled,publicLink,hasAccessToAllBuilds',
+          }
+        );
+        const groups = (data as Array<{ id: string; attributes: Record<string, unknown> }>).map(g => ({
+          id: g.id,
+          ...g.attributes,
+        }));
+        return { content: [{ type: 'text' as const, text: JSON.stringify(groups, null, 2) }] };
+      } catch (error) {
+        return formatError(error);
+      }
+    }
+  );
+
+  server.tool(
+    'list_beta_feedback',
+    'List beta tester feedback (crash reports, screenshots, text feedback) for a build',
+    {
+      buildId: z.string().describe('Build resource ID (from list_builds)'),
+      limit: z.number().optional().describe('Max results (default 20)'),
+    },
+    async ({ buildId, limit }) => {
+      try {
+        const data = await client.requestAll(
+          `/v1/builds/${buildId}/betaAppReviewSubmissions`,
+          { 'limit': String(limit ?? 20) }
+        );
+
+        // Also fetch beta tester feedback directly
+        const feedback = await client.requestAll(
+          `/v1/builds/${buildId}/betaBuildLocalizations`,
+          {
+            'fields[betaBuildLocalizations]': 'locale,whatsNew',
+          }
+        );
+
+        const localizations = (feedback as Array<{ id: string; attributes: Record<string, unknown> }>).map(l => ({
+          id: l.id,
+          ...l.attributes,
+        }));
+
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `Build ${buildId} beta info:\n\nBuild localizations (What's New):\n${JSON.stringify(localizations, null, 2)}\n\nReview submissions:\n${JSON.stringify(data, null, 2)}`,
+          }],
+        };
+      } catch (error) {
+        return formatError(error);
+      }
+    }
+  );
+
+  server.tool(
+    'update_beta_build_localization',
+    'Set or update the "What\'s New" text shown to testers in TestFlight for a specific build',
+    {
+      buildId: z.string().describe('Build resource ID (from list_builds)'),
+      whatsNew: z.string().describe('What\'s new text for testers'),
+      locale: z.string().optional().describe('Locale code (default "en-US")'),
+    },
+    async ({ buildId, whatsNew, locale }) => {
+      try {
+        const loc = locale ?? 'en-US';
+
+        // Check if localization already exists
+        const existing = await client.requestAll(
+          `/v1/builds/${buildId}/betaBuildLocalizations`,
+          { 'fields[betaBuildLocalizations]': 'locale' }
+        ) as Array<{ id: string; attributes: { locale: string } }>;
+
+        const match = existing.find(l => l.attributes.locale === loc);
+
+        if (match) {
+          const result = await client.request<{ data: { id: string; attributes: Record<string, unknown> } }>(
+            `/v1/betaBuildLocalizations/${match.id}`,
+            {
+              method: 'PATCH',
+              body: {
+                data: {
+                  type: 'betaBuildLocalizations',
+                  id: match.id,
+                  attributes: { whatsNew },
+                },
+              },
+            }
+          );
+          return { content: [{ type: 'text' as const, text: `Updated "What's New" for ${loc}.\n${JSON.stringify({ id: result.data.id, ...result.data.attributes }, null, 2)}` }] };
+        } else {
+          const result = await client.request<{ data: { id: string; attributes: Record<string, unknown> } }>(
+            '/v1/betaBuildLocalizations',
+            {
+              method: 'POST',
+              body: {
+                data: {
+                  type: 'betaBuildLocalizations',
+                  attributes: { locale: loc, whatsNew },
+                  relationships: {
+                    build: { data: { type: 'builds', id: buildId } },
+                  },
+                },
+              },
+            }
+          );
+          return { content: [{ type: 'text' as const, text: `Created "What's New" for ${loc}.\n${JSON.stringify({ id: result.data.id, ...result.data.attributes }, null, 2)}` }] };
+        }
+      } catch (error) {
+        return formatError(error);
+      }
+    }
+  );
+
+  server.tool(
     'get_beta_app_info',
     'Get the beta app description, review contact info, and localization status for an app. Shows what\'s needed for TestFlight external testing.',
     {

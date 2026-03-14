@@ -17,10 +17,12 @@ export function registerAppStoreVersionTools(server: McpServer, client: AppStore
           `/v1/apps/${appId}/appStoreVersions`,
           {
             'fields[appStoreVersions]': 'versionString,appStoreState,platform,releaseType,createdDate',
+            'include': 'appStoreVersionPhasedRelease',
+            'fields[appStoreVersionPhasedReleases]': 'phasedReleaseState,currentDayNumber,startDate,totalPauseDuration',
             'limit': String(limit ?? 10),
           }
         );
-        const versions = (data as Array<{ id: string; attributes: Record<string, unknown> }>).map(v => ({
+        const versions = (data as Array<{ id: string; attributes: Record<string, unknown>; relationships?: Record<string, unknown> }>).map(v => ({
           id: v.id,
           ...v.attributes,
         }));
@@ -40,15 +42,17 @@ export function registerAppStoreVersionTools(server: McpServer, client: AppStore
       platform: z.enum(['IOS', 'MAC_OS', 'TV_OS', 'VISION_OS']).describe('Platform for this version'),
       buildId: z.string().optional().describe('Build resource ID to attach (from list_builds). Can also be set later.'),
       releaseType: z.enum(['MANUAL', 'AFTER_APPROVAL', 'SCHEDULED']).optional().describe('Release type (default AFTER_APPROVAL)'),
+      earliestReleaseDate: z.string().optional().describe('Scheduled release date in ISO 8601 format (e.g. "2026-04-01T00:00:00-04:00"). Required when releaseType is SCHEDULED.'),
       copyright: z.string().optional().describe('Copyright text (e.g. "2026 Doctor Durant LLC")'),
     },
-    async ({ appId, versionString, platform, buildId, releaseType, copyright }) => {
+    async ({ appId, versionString, platform, buildId, releaseType, earliestReleaseDate, copyright }) => {
       try {
         const attributes: Record<string, string> = {
           platform,
           versionString,
           releaseType: releaseType ?? 'AFTER_APPROVAL',
         };
+        if (earliestReleaseDate) attributes.earliestReleaseDate = earliestReleaseDate;
         if (copyright) attributes.copyright = copyright;
 
         const relationships: Record<string, unknown> = {
@@ -141,6 +145,73 @@ export function registerAppStoreVersionTools(server: McpServer, client: AppStore
   );
 
   server.tool(
+    'create_version_localization',
+    'Add a new locale to an App Store version (e.g. add Spanish, French, etc.). Use get_version_localizations first to see existing locales.',
+    {
+      versionId: z.string().describe('App Store version resource ID'),
+      locale: z.string().describe('Locale code (e.g. "es-ES", "fr-FR", "de-DE", "ja", "zh-Hans")'),
+      description: z.string().optional().describe('App description for the App Store'),
+      whatsNew: z.string().optional().describe('What\'s new in this version'),
+      keywords: z.string().optional().describe('Search keywords (comma-separated, max 100 chars)'),
+      promotionalText: z.string().optional().describe('Promotional text'),
+      marketingUrl: z.string().optional().describe('Marketing URL'),
+      supportUrl: z.string().optional().describe('Support URL'),
+    },
+    async ({ versionId, locale, description, whatsNew, keywords, promotionalText, marketingUrl, supportUrl }) => {
+      try {
+        const attributes: Record<string, string> = { locale };
+        if (description !== undefined) attributes.description = description;
+        if (whatsNew !== undefined) attributes.whatsNew = whatsNew;
+        if (keywords !== undefined) attributes.keywords = keywords;
+        if (promotionalText !== undefined) attributes.promotionalText = promotionalText;
+        if (marketingUrl !== undefined) attributes.marketingUrl = marketingUrl;
+        if (supportUrl !== undefined) attributes.supportUrl = supportUrl;
+
+        const body = {
+          data: {
+            type: 'appStoreVersionLocalizations',
+            attributes,
+            relationships: {
+              appStoreVersion: {
+                data: { type: 'appStoreVersions', id: versionId },
+              },
+            },
+          },
+        };
+
+        const result = await client.request<{ data: { id: string; attributes: Record<string, unknown> } }>(
+          '/v1/appStoreVersionLocalizations',
+          { method: 'POST', body }
+        );
+
+        const localization = { id: result.data.id, ...result.data.attributes };
+        return { content: [{ type: 'text' as const, text: `Localization created for ${locale}.\n${JSON.stringify(localization, null, 2)}` }] };
+      } catch (error) {
+        return formatError(error);
+      }
+    }
+  );
+
+  server.tool(
+    'delete_version_localization',
+    'Remove a locale from an App Store version',
+    {
+      localizationId: z.string().describe('Localization resource ID (from get_version_localizations)'),
+    },
+    async ({ localizationId }) => {
+      try {
+        await client.request(
+          `/v1/appStoreVersionLocalizations/${localizationId}`,
+          { method: 'DELETE' }
+        );
+        return { content: [{ type: 'text' as const, text: `Localization ${localizationId} deleted.` }] };
+      } catch (error) {
+        return formatError(error);
+      }
+    }
+  );
+
+  server.tool(
     'update_version_localization',
     'Update App Store listing text for a version localization (description, what\'s new, keywords, etc.)',
     {
@@ -184,6 +255,92 @@ export function registerAppStoreVersionTools(server: McpServer, client: AppStore
 
         const localization = { id: result.data.id, ...result.data.attributes };
         return { content: [{ type: 'text' as const, text: JSON.stringify(localization, null, 2) }] };
+      } catch (error) {
+        return formatError(error);
+      }
+    }
+  );
+
+  server.tool(
+    'enable_phased_release',
+    'Enable phased release for an App Store version. Apple rolls out over 7 days (1% → 2% → 5% → 10% → 20% → 50% → 100%). You can pause/resume at any time.',
+    {
+      versionId: z.string().describe('App Store version resource ID'),
+    },
+    async ({ versionId }) => {
+      try {
+        const body = {
+          data: {
+            type: 'appStoreVersionPhasedReleases',
+            attributes: {
+              phasedReleaseState: 'ACTIVE',
+            },
+            relationships: {
+              appStoreVersion: {
+                data: { type: 'appStoreVersions', id: versionId },
+              },
+            },
+          },
+        };
+
+        const result = await client.request<{ data: { id: string; attributes: Record<string, unknown> } }>(
+          '/v1/appStoreVersionPhasedReleases',
+          { method: 'POST', body }
+        );
+
+        const release = { id: result.data.id, ...result.data.attributes };
+        return { content: [{ type: 'text' as const, text: `Phased release enabled.\n${JSON.stringify(release, null, 2)}` }] };
+      } catch (error) {
+        return formatError(error);
+      }
+    }
+  );
+
+  server.tool(
+    'update_phased_release',
+    'Pause, resume, or complete a phased release. Use PAUSE to halt rollout, ACTIVE to resume, or COMPLETE to release to 100% immediately.',
+    {
+      phasedReleaseId: z.string().describe('Phased release resource ID (from enable_phased_release)'),
+      state: z.enum(['ACTIVE', 'PAUSE', 'COMPLETE']).describe('ACTIVE = resume rollout, PAUSE = halt at current percentage, COMPLETE = release to all users immediately'),
+    },
+    async ({ phasedReleaseId, state }) => {
+      try {
+        const body = {
+          data: {
+            type: 'appStoreVersionPhasedReleases',
+            id: phasedReleaseId,
+            attributes: {
+              phasedReleaseState: state,
+            },
+          },
+        };
+
+        const result = await client.request<{ data: { id: string; attributes: Record<string, unknown> } }>(
+          `/v1/appStoreVersionPhasedReleases/${phasedReleaseId}`,
+          { method: 'PATCH', body }
+        );
+
+        const release = { id: result.data.id, ...result.data.attributes };
+        return { content: [{ type: 'text' as const, text: `Phased release updated to ${state}.\n${JSON.stringify(release, null, 2)}` }] };
+      } catch (error) {
+        return formatError(error);
+      }
+    }
+  );
+
+  server.tool(
+    'delete_phased_release',
+    'Remove phased release from a version (reverts to immediate full release)',
+    {
+      phasedReleaseId: z.string().describe('Phased release resource ID'),
+    },
+    async ({ phasedReleaseId }) => {
+      try {
+        await client.request(
+          `/v1/appStoreVersionPhasedReleases/${phasedReleaseId}`,
+          { method: 'DELETE' }
+        );
+        return { content: [{ type: 'text' as const, text: `Phased release removed. Version will release to all users immediately upon approval.` }] };
       } catch (error) {
         return formatError(error);
       }
