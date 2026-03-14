@@ -381,7 +381,7 @@ export function registerDeployTools(server: McpServer, client: AppStoreConnectCl
             body: {
               data: {
                 type: 'betaGroups',
-                attributes: { name: intGroupName, isInternalGroup: true },
+                attributes: { name: intGroupName, isInternalGroup: true, hasAccessToAllBuilds: true },
                 relationships: { app: { data: { type: 'apps', id: appId } } },
               },
             },

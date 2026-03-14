@@ -80,6 +80,7 @@ export function registerTestingTools(server: McpServer, client: AppStoreConnectC
               name,
               isInternalGroup: isInternalGroup ?? false,
               publicLinkEnabled: publicLinkEnabled ?? false,
+              ...((isInternalGroup ?? false) ? { hasAccessToAllBuilds: true } : {}),
             },
             relationships: {
               app: {
