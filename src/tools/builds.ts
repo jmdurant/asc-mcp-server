@@ -136,7 +136,7 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
             ], { maxBuffer: 10 * 1024 * 1024, timeout: 60000 });
 
             const currentBuildNum = settingsOut.match(/CURRENT_PROJECT_VERSION = (.+)/)?.[1]?.trim();
-            const currentBundleId = settingsOut.match(/PRODUCT_BUNDLE_IDENTIFIER = (.+)/)?.[1]?.trim();
+            const currentBundleId = settingsOut.match(/(?<![_\w])PRODUCT_BUNDLE_IDENTIFIER = (.+)/)?.[1]?.trim();
 
             if (currentBundleId) {
               // Resolve app ID from bundle ID if not provided
@@ -193,7 +193,102 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
           archiveArgs.push(`CURRENT_PROJECT_VERSION=${buildNumberOverride}`);
           // Also set FLUTTER_BUILD_NUMBER for Flutter projects
           archiveArgs.push(`FLUTTER_BUILD_NUMBER=${buildNumberOverride}`);
+
+          // Update Info.plists in sub-projects (watch apps, widgets, extensions)
+          // that may have hardcoded CFBundleVersion not overridden by xcodebuild settings
+          try {
+            const path = await import('node:path');
+            const projectDir = path.dirname(projectPath);
+            // Search sibling directories and parent for Info.plist files with CFBundleVersion
+            const searchDirs = [projectDir, path.dirname(projectDir)];
+            for (const dir of searchDirs) {
+              try {
+                const { stdout: plists } = await execFileAsync('find', [
+                  dir, '-name', 'Info.plist', '-not', '-path', '*/DerivedData/*',
+                  '-not', '-path', '*/Pods/*', '-not', '-path', '*/.build/*',
+                  '-not', '-path', '*/build/*', '-maxdepth', '5',
+                ], { timeout: 10_000 });
+                for (const plist of plists.trim().split('\n').filter(Boolean)) {
+                  try {
+                    const { stdout: version } = await execFileAsync('plutil', [
+                      '-extract', 'CFBundleVersion', 'raw', '-o', '-', plist,
+                    ]);
+                    if (version.trim() && version.trim() !== buildNumberOverride) {
+                      await execFileAsync('plutil', [
+                        '-replace', 'CFBundleVersion', '-string', buildNumberOverride, plist,
+                      ]);
+                    }
+                  } catch { /* plist doesn't have CFBundleVersion — skip */ }
+                }
+              } catch { /* find failed for this dir — skip */ }
+            }
+          } catch { /* non-fatal — sub-project version sync is best-effort */ }
         }
+
+        // Pre-archive: inject missing privacy usage descriptions to avoid ITMS-90683
+        try {
+          const pathMod = await import('node:path');
+          const { readFileSync: readPlist, writeFileSync: writePlist } = await import('node:fs');
+          const projectDir = pathMod.dirname(projectPath);
+
+          // Common privacy keys Apple flags for — with safe default descriptions
+          const privacyDefaults: Record<string, string> = {
+            NSBluetoothAlwaysUsageDescription: 'This app may use Bluetooth for device connectivity.',
+            NSBluetoothPeripheralUsageDescription: 'This app may use Bluetooth peripherals.',
+            NSCalendarsUsageDescription: 'This app may access your calendar.',
+            NSCameraUsageDescription: 'This app may use the camera.',
+            NSContactsUsageDescription: 'This app may access your contacts.',
+            NSFaceIDUsageDescription: 'This app may use Face ID for authentication.',
+            NSLocationWhenInUseUsageDescription: 'This app may use your location.',
+            NSMicrophoneUsageDescription: 'This app may use the microphone.',
+            NSPhotoLibraryUsageDescription: 'This app may access your photo library.',
+            NSSpeechRecognitionUsageDescription: 'This app may use speech recognition.',
+          };
+
+          // Find the main app Info.plist (look for APPL bundle type)
+          const { stdout: appPlists } = await execFileAsync('find', [
+            projectDir, '-name', 'Info.plist',
+            '-not', '-path', '*/DerivedData/*', '-not', '-path', '*/Pods/*',
+            '-not', '-path', '*/.build/*', '-not', '-path', '*/build/*',
+            '-not', '-path', '*/.dart_tool/*', '-maxdepth', '4',
+          ], { timeout: 10_000 });
+
+          for (const plist of appPlists.trim().split('\n').filter(Boolean)) {
+            try {
+              const content = readPlist(plist, 'utf8');
+              // Only patch app plists (not extensions)
+              if (!content.includes('CFBundlePackageType') || !content.includes('APPL')) continue;
+
+              let modified = false;
+              let updated = content;
+              for (const [key, defaultValue] of Object.entries(privacyDefaults)) {
+                if (!updated.includes(key)) {
+                  // Insert before the closing </dict>
+                  const insertPoint = updated.lastIndexOf('</dict>');
+                  if (insertPoint !== -1) {
+                    const indent = updated.includes('\t<key>') ? '\t' : '    ';
+                    const entry = `${indent}<key>${key}</key>\n${indent}<string>${defaultValue}</string>\n`;
+                    updated = updated.slice(0, insertPoint) + entry + updated.slice(insertPoint);
+                    modified = true;
+                  }
+                }
+              }
+              // Also inject export compliance key (boolean, not string)
+              if (!updated.includes('ITSAppUsesNonExemptEncryption')) {
+                const insertPoint = updated.lastIndexOf('</dict>');
+                if (insertPoint !== -1) {
+                  const indent = updated.includes('\t<key>') ? '\t' : '    ';
+                  const entry = `${indent}<key>ITSAppUsesNonExemptEncryption</key>\n${indent}<false/>\n`;
+                  updated = updated.slice(0, insertPoint) + entry + updated.slice(insertPoint);
+                  modified = true;
+                }
+              }
+              if (modified) {
+                writePlist(plist, updated, 'utf8');
+              }
+            } catch { /* skip unreadable plists */ }
+          }
+        } catch { /* non-fatal — privacy key injection is best-effort */ }
 
         const { stdout: archiveOut, stderr: archiveErr } = await execFileAsync('xcodebuild',
           archiveArgs,
@@ -229,6 +324,40 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
             'Failed to extract version info from archive. Ensure the archive was built correctly.'
           ));
         }
+
+        // Post-archive: sync CFBundleVersion and CFBundleShortVersionString across all embedded bundles
+        try {
+          const { stdout: archivePlists } = await execFileAsync('find', [
+            `${archive}/Products`, '-name', 'Info.plist', '-maxdepth', '8',
+          ], { timeout: 10_000 });
+          let fixedCount = 0;
+          for (const plist of archivePlists.trim().split('\n').filter(Boolean)) {
+            try {
+              // Sync CFBundleVersion
+              const { stdout: embeddedVer } = await execFileAsync('plutil', [
+                '-extract', 'CFBundleVersion', 'raw', '-o', '-', plist,
+              ]);
+              if (embeddedVer.trim() !== bundleVersion) {
+                await execFileAsync('plutil', [
+                  '-replace', 'CFBundleVersion', '-string', bundleVersion, plist,
+                ]);
+                fixedCount++;
+              }
+            } catch { /* no CFBundleVersion — skip */ }
+            try {
+              // Sync CFBundleShortVersionString
+              const { stdout: embeddedShort } = await execFileAsync('plutil', [
+                '-extract', 'CFBundleShortVersionString', 'raw', '-o', '-', plist,
+              ]);
+              if (embeddedShort.trim() !== bundleShortVersion) {
+                await execFileAsync('plutil', [
+                  '-replace', 'CFBundleShortVersionString', '-string', bundleShortVersion, plist,
+                ]);
+                fixedCount++;
+              }
+            } catch { /* no CFBundleShortVersionString — skip */ }
+          }
+        } catch { /* non-fatal — version sync in archive is best-effort */ }
 
         // watchOS post-archive validation
         if (isWatchOS) {
@@ -643,6 +772,82 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
           }
         } catch {
           // Non-fatal — just skip this check
+        }
+      }
+
+      // 8. Check build number consistency and ASC build number
+      if (projectPath) {
+        try {
+          const { readFileSync: readFileVer } = await import('node:fs');
+          const { dirname: dirnameVer } = await import('node:path');
+          const projectDirVer = dirnameVer(projectPath);
+
+          // Find all Info.plists with CFBundleVersion
+          const { stdout: versionPlists } = await execFileAsync('find', [
+            projectDirVer, '-name', 'Info.plist',
+            '-not', '-path', '*/DerivedData/*', '-not', '-path', '*/Pods/*',
+            '-not', '-path', '*/.build/*', '-not', '-path', '*/build/*',
+            '-not', '-path', '*/.dart_tool/*', '-maxdepth', '5',
+          ], { timeout: 10_000 });
+
+          const versionMap: Array<{ file: string; version: string }> = [];
+          for (const plist of versionPlists.trim().split('\n').filter(Boolean)) {
+            try {
+              const { stdout: ver } = await execFileAsync('plutil', [
+                '-extract', 'CFBundleVersion', 'raw', '-o', '-', plist,
+              ]);
+              const relative = plist.replace(projectDirVer + '/', '');
+              versionMap.push({ file: relative, version: ver.trim() });
+            } catch { /* no CFBundleVersion — skip */ }
+          }
+
+          if (versionMap.length > 1) {
+            const versions = new Set(versionMap.map(v => v.version));
+            if (versions.size > 1) {
+              const details = versionMap.map(v => `   ${v.file}: ${v.version}`).join('\n');
+              issues.push(
+                `CFBundleVersion mismatch across targets — Apple will reject the upload:\n${details}\n` +
+                '   → All targets (app, watch, widgets, extensions) must have the same CFBundleVersion.'
+              );
+            } else {
+              ok.push(`Build version consistency: all ${versionMap.length} targets at version ${versionMap[0].version}`);
+            }
+          }
+
+          // Check against ASC to see if build number needs incrementing
+          try {
+            const apps = await client.requestAll('/v1/apps', {
+              'filter[bundleId]': bundleId,
+              'fields[apps]': 'bundleId',
+            }) as Array<{ id: string }>;
+            if (apps.length > 0) {
+              const existingBuilds = await client.requestAll('/v1/builds', {
+                'filter[app]': apps[0].id,
+                'fields[builds]': 'version',
+                'sort': '-uploadedDate',
+                'limit': '200',
+              }) as Array<{ id: string; attributes: { version: string } }>;
+              if (existingBuilds.length > 0) {
+                const maxBuild = Math.max(...existingBuilds.map(b => parseInt(b.attributes.version, 10)).filter(n => !isNaN(n)));
+                const localVersion = versionMap[0]?.version;
+                const localNum = parseInt(localVersion ?? '0', 10);
+                if (!isNaN(maxBuild)) {
+                  if (localNum <= maxBuild) {
+                    issues.push(
+                      `Build number ${localVersion} already uploaded to ASC (max: ${maxBuild}).\n` +
+                      `   → upload_build will auto-increment to ${maxBuild + 1}, but you can also update manually.`
+                    );
+                  } else {
+                    ok.push(`Build number ${localVersion} is new (ASC max: ${maxBuild})`);
+                  }
+                }
+              } else {
+                ok.push(`No existing builds in ASC — build number ${versionMap[0]?.version ?? 'unknown'} is fine`);
+              }
+            }
+          } catch { /* non-fatal — ASC check is best-effort in preflight */ }
+        } catch {
+          // Non-fatal
         }
       }
 

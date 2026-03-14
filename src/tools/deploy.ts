@@ -71,7 +71,7 @@ export function registerDeployTools(server: McpServer, client: AppStoreConnectCl
           projectFlag, projectPath, '-scheme', scheme, '-showBuildSettings',
         ], { maxBuffer: 10 * 1024 * 1024, timeout: 60000 });
 
-        const currentBundleId = settingsOut.match(/PRODUCT_BUNDLE_IDENTIFIER = (.+)/)?.[1]?.trim();
+        const currentBundleId = settingsOut.match(/(?<![_\w])PRODUCT_BUNDLE_IDENTIFIER = (.+)/)?.[1]?.trim();
         const currentBuildNum = settingsOut.match(/CURRENT_PROJECT_VERSION = (.+)/)?.[1]?.trim();
         if (!currentBundleId) {
           return formatError(new Error('Could not detect PRODUCT_BUNDLE_IDENTIFIER from build settings.'));
@@ -158,7 +158,98 @@ export function registerDeployTools(server: McpServer, client: AppStoreConnectCl
         if (buildNumberOverride) {
           archiveArgs.push(`CURRENT_PROJECT_VERSION=${buildNumberOverride}`);
           archiveArgs.push(`FLUTTER_BUILD_NUMBER=${buildNumberOverride}`);
+
+          // Update Info.plists in sub-projects (watch apps, widgets, extensions)
+          // that may have hardcoded CFBundleVersion not overridden by xcodebuild settings
+          try {
+            const path = await import('node:path');
+            const projectDir = path.dirname(projectPath);
+            const searchDirs = [projectDir, path.dirname(projectDir)];
+            for (const dir of searchDirs) {
+              try {
+                const { stdout: plists } = await execFileAsync('find', [
+                  dir, '-name', 'Info.plist', '-not', '-path', '*/DerivedData/*',
+                  '-not', '-path', '*/Pods/*', '-not', '-path', '*/.build/*',
+                  '-not', '-path', '*/build/*', '-maxdepth', '5',
+                ], { timeout: 10_000 });
+                for (const plist of plists.trim().split('\n').filter(Boolean)) {
+                  try {
+                    const { stdout: version } = await execFileAsync('plutil', [
+                      '-extract', 'CFBundleVersion', 'raw', '-o', '-', plist,
+                    ]);
+                    if (version.trim() && version.trim() !== buildNumberOverride) {
+                      await execFileAsync('plutil', [
+                        '-replace', 'CFBundleVersion', '-string', buildNumberOverride, plist,
+                      ]);
+                    }
+                  } catch { /* plist doesn't have CFBundleVersion — skip */ }
+                }
+              } catch { /* find failed for this dir — skip */ }
+            }
+          } catch { /* non-fatal — sub-project version sync is best-effort */ }
         }
+
+        // Pre-archive: inject missing privacy usage descriptions to avoid ITMS-90683
+        try {
+          const pathMod = await import('node:path');
+          const { readFileSync: readPlist, writeFileSync: writePlist } = await import('node:fs');
+          const pDir = pathMod.dirname(projectPath);
+
+          const privacyDefaults: Record<string, string> = {
+            NSBluetoothAlwaysUsageDescription: 'This app may use Bluetooth for device connectivity.',
+            NSBluetoothPeripheralUsageDescription: 'This app may use Bluetooth peripherals.',
+            NSCalendarsUsageDescription: 'This app may access your calendar.',
+            NSCameraUsageDescription: 'This app may use the camera.',
+            NSContactsUsageDescription: 'This app may access your contacts.',
+            NSFaceIDUsageDescription: 'This app may use Face ID for authentication.',
+            NSLocationWhenInUseUsageDescription: 'This app may use your location.',
+            NSMicrophoneUsageDescription: 'This app may use the microphone.',
+            NSPhotoLibraryUsageDescription: 'This app may access your photo library.',
+            NSSpeechRecognitionUsageDescription: 'This app may use speech recognition.',
+          };
+
+          const { stdout: appPlists } = await execFileAsync('find', [
+            pDir, '-name', 'Info.plist',
+            '-not', '-path', '*/DerivedData/*', '-not', '-path', '*/Pods/*',
+            '-not', '-path', '*/.build/*', '-not', '-path', '*/build/*',
+            '-not', '-path', '*/.dart_tool/*', '-maxdepth', '4',
+          ], { timeout: 10_000 });
+
+          for (const plist of appPlists.trim().split('\n').filter(Boolean)) {
+            try {
+              const content = readPlist(plist, 'utf8');
+              if (!content.includes('CFBundlePackageType') || !content.includes('APPL')) continue;
+
+              let modified = false;
+              let updated = content;
+              for (const [key, defaultValue] of Object.entries(privacyDefaults)) {
+                if (!updated.includes(key)) {
+                  const insertPoint = updated.lastIndexOf('</dict>');
+                  if (insertPoint !== -1) {
+                    const indent = updated.includes('\t<key>') ? '\t' : '    ';
+                    const entry = `${indent}<key>${key}</key>\n${indent}<string>${defaultValue}</string>\n`;
+                    updated = updated.slice(0, insertPoint) + entry + updated.slice(insertPoint);
+                    modified = true;
+                  }
+                }
+              }
+              // Also inject export compliance key (boolean, not string)
+              if (!updated.includes('ITSAppUsesNonExemptEncryption')) {
+                const insertPoint = updated.lastIndexOf('</dict>');
+                if (insertPoint !== -1) {
+                  const indent = updated.includes('\t<key>') ? '\t' : '    ';
+                  const entry = `${indent}<key>ITSAppUsesNonExemptEncryption</key>\n${indent}<false/>\n`;
+                  updated = updated.slice(0, insertPoint) + entry + updated.slice(insertPoint);
+                  modified = true;
+                }
+              }
+              if (modified) {
+                writePlist(plist, updated, 'utf8');
+                info('Injected missing privacy/compliance keys into Info.plist');
+              }
+            } catch { /* skip */ }
+          }
+        } catch { /* non-fatal */ }
 
         const { stdout: archiveOut, stderr: archiveErr } = await execFileAsync('xcodebuild',
           archiveArgs,
@@ -187,6 +278,41 @@ export function registerDeployTools(server: McpServer, client: AppStoreConnectCl
         const bundleVersion = bv.trim();
         const bundleId = bi.trim();
         info(`Version: ${bundleShortVersion} (${bundleVersion})`);
+
+        // Post-archive: sync CFBundleVersion and CFBundleShortVersionString across all embedded bundles
+        try {
+          const { stdout: archivePlists } = await execFileAsync('find', [
+            `${archive}/Products`, '-name', 'Info.plist', '-maxdepth', '8',
+          ], { timeout: 10_000 });
+          let fixedCount = 0;
+          for (const plist of archivePlists.trim().split('\n').filter(Boolean)) {
+            try {
+              const { stdout: embeddedVer } = await execFileAsync('plutil', [
+                '-extract', 'CFBundleVersion', 'raw', '-o', '-', plist,
+              ]);
+              if (embeddedVer.trim() !== bundleVersion) {
+                await execFileAsync('plutil', [
+                  '-replace', 'CFBundleVersion', '-string', bundleVersion, plist,
+                ]);
+                fixedCount++;
+              }
+            } catch { /* no CFBundleVersion — skip */ }
+            try {
+              const { stdout: embeddedShort } = await execFileAsync('plutil', [
+                '-extract', 'CFBundleShortVersionString', 'raw', '-o', '-', plist,
+              ]);
+              if (embeddedShort.trim() !== bundleShortVersion) {
+                await execFileAsync('plutil', [
+                  '-replace', 'CFBundleShortVersionString', '-string', bundleShortVersion, plist,
+                ]);
+                fixedCount++;
+              }
+            } catch { /* no CFBundleShortVersionString — skip */ }
+          }
+          if (fixedCount > 0) {
+            info(`Fixed versions in ${fixedCount} embedded bundle(s)`);
+          }
+        } catch { /* non-fatal */ }
 
         // ─────────────────────────────────────────────
         // STEP 4: Export

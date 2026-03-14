@@ -2,7 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { AppStoreConnectClient } from '../client.js';
 import type { Config } from '../config.js';
-import { formatError } from '../errors.js';
+import { AppStoreConnectError, formatError } from '../errors.js';
 
 export function registerTestingTools(server: McpServer, client: AppStoreConnectClient, config: Config) {
   server.tool(
@@ -43,6 +43,23 @@ export function registerTestingTools(server: McpServer, client: AppStoreConnectC
     },
     async ({ email, firstName, lastName, betaGroupId }) => {
       try {
+        // Check if tester already exists
+        const existing = await client.requestAll('/v1/betaTesters', {
+          'filter[email]': email,
+          'filter[betaGroups]': betaGroupId,
+          'fields[betaTesters]': 'email,firstName,lastName',
+          'limit': '1',
+        }) as Array<{ id: string; attributes: Record<string, unknown> }>;
+
+        if (existing.length > 0) {
+          return {
+            content: [{
+              type: 'text' as const,
+              text: `Tester ${email} is already in this beta group.`,
+            }],
+          };
+        }
+
         const body = {
           data: {
             type: 'betaTesters',
@@ -57,6 +74,14 @@ export function registerTestingTools(server: McpServer, client: AppStoreConnectC
         const result = await client.request('/v1/betaTesters', { method: 'POST', body });
         return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
       } catch (error) {
+        if (error instanceof AppStoreConnectError && error.status === 409) {
+          return {
+            content: [{
+              type: 'text' as const,
+              text: `Tester ${email} already exists. They may already be in this group or added at the account level.`,
+            }],
+          };
+        }
         return formatError(error);
       }
     }
@@ -149,35 +174,45 @@ export function registerTestingTools(server: McpServer, client: AppStoreConnectC
 
   server.tool(
     'list_beta_feedback',
-    'List beta tester feedback (crash reports, screenshots, text feedback) for a build',
+    'List beta build info: What\'s New text, build state, and localization details. Note: tester screenshot/text feedback is only available in the App Store Connect web UI.',
     {
       buildId: z.string().describe('Build resource ID (from list_builds)'),
-      limit: z.number().optional().describe('Max results (default 20)'),
     },
-    async ({ buildId, limit }) => {
+    async ({ buildId }) => {
       try {
-        const data = await client.requestAll(
-          `/v1/builds/${buildId}/betaAppReviewSubmissions`,
-          { 'limit': String(limit ?? 20) }
-        );
+        const sections: string[] = [];
 
-        // Also fetch beta tester feedback directly
-        const feedback = await client.requestAll(
-          `/v1/builds/${buildId}/betaBuildLocalizations`,
-          {
-            'fields[betaBuildLocalizations]': 'locale,whatsNew',
+        // 1. Build localizations (What's New text)
+        try {
+          const localizations = await client.requestAll(
+            `/v1/builds/${buildId}/betaBuildLocalizations`,
+            { 'fields[betaBuildLocalizations]': 'locale,whatsNew' }
+          ) as Array<{ id: string; attributes: Record<string, unknown> }>;
+
+          const locs = localizations.map(l => ({ id: l.id, ...l.attributes }));
+          sections.push(`Build Localizations:\n${JSON.stringify(locs, null, 2)}`);
+        } catch { /* non-fatal */ }
+
+        // 2. Build beta detail (internal/external state)
+        try {
+          const detail = await client.request<{ data: { id: string; attributes: Record<string, unknown> } }>(
+            `/v1/builds/${buildId}/buildBetaDetail`,
+            { params: { 'fields[buildBetaDetails]': 'autoNotifyEnabled,externalBuildState,internalBuildState' } }
+          );
+          if (detail?.data) {
+            sections.push(`Build Beta Detail:\n${JSON.stringify({ id: detail.data.id, ...detail.data.attributes }, null, 2)}`);
           }
-        );
+        } catch { /* non-fatal */ }
 
-        const localizations = (feedback as Array<{ id: string; attributes: Record<string, unknown> }>).map(l => ({
-          id: l.id,
-          ...l.attributes,
-        }));
+        sections.push(
+          'Note: Tester screenshot/text feedback is not available via the API.\n' +
+          'View it at: https://appstoreconnect.apple.com → My Apps → TestFlight → Feedback'
+        );
 
         return {
           content: [{
             type: 'text' as const,
-            text: `Build ${buildId} beta info:\n\nBuild localizations (What's New):\n${JSON.stringify(localizations, null, 2)}\n\nReview submissions:\n${JSON.stringify(data, null, 2)}`,
+            text: `Build ${buildId} info:\n\n${sections.join('\n\n')}`,
           }],
         };
       } catch (error) {
