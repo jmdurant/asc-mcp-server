@@ -14,34 +14,57 @@
 4. Download the `.p8` private key file (you can only download this once)
 5. Save it to a secure location
 
-## Environment Variables
+## Install & Build
 
-Set these in your shell profile:
+```bash
+npm install
+npm run build
+```
 
-### macOS / Linux (`~/.zshrc` or `~/.bashrc`)
+## Configure Credentials
+
+### Option 1: Shared `.env` file (Recommended)
+
+Create `~/.env` with your credentials. The `.mcp.json` shell wrapper sources this automatically before launching the server.
+
+```bash
+# ~/.env
+ASC_KEY_ID="YOUR_KEY_ID"
+ASC_ISSUER_ID="YOUR_ISSUER_ID"
+ASC_KEY_PATH="/path/to/AuthKey_YOURKEYID.p8"
+ASC_CONTACT_PHONE="+1XXXXXXXXXX"
+```
+
+Secure it:
+```bash
+chmod 600 ~/.env
+```
+
+You can also create a project-level `.env` to override per-project. The server sources `$HOME/.env` first, then `./.env`.
+
+### Option 2: Shell profile environment variables
+
+#### macOS / Linux (`~/.zshrc` or `~/.bashrc`)
 
 ```bash
 export ASC_KEY_ID="YOUR_KEY_ID"
 export ASC_ISSUER_ID="YOUR_ISSUER_ID"
 export ASC_KEY_PATH="/path/to/AuthKey_YOURKEYID.p8"
-export ASC_CONTACT_PHONE="+1XXXXXXXXXX"  # Required for some ASC operations
+export ASC_CONTACT_PHONE="+1XXXXXXXXXX"
 ```
 
 Then reload: `source ~/.zshrc`
 
-### Windows (PowerShell profile or System Environment Variables)
+#### Windows (PowerShell profile)
 
 ```powershell
-# PowerShell profile (~\Documents\PowerShell\Microsoft.PowerShell_profile.ps1)
 $env:ASC_KEY_ID = "YOUR_KEY_ID"
 $env:ASC_ISSUER_ID = "YOUR_ISSUER_ID"
 $env:ASC_KEY_PATH = "C:\Users\YOU\.appstoreconnect\AuthKey_YOURKEYID.p8"
 $env:ASC_CONTACT_PHONE = "+1XXXXXXXXXX"
 ```
 
-Or set via System → Advanced → Environment Variables.
-
-### Windows (CMD)
+#### Windows (CMD — persistent)
 
 ```cmd
 setx ASC_KEY_ID "YOUR_KEY_ID"
@@ -50,36 +73,34 @@ setx ASC_KEY_PATH "C:\Users\YOU\.appstoreconnect\AuthKey_YOURKEYID.p8"
 setx ASC_CONTACT_PHONE "+1XXXXXXXXXX"
 ```
 
-## Install & Build
-
-```bash
-npm install
-npm run build
-```
-
 ## Add to Claude Code
 
 Copy `.mcp.json.example` to your project's `.mcp.json` (or merge into existing):
 
-```bash
-cp .mcp.json.example /path/to/your/project/.mcp.json
-```
-
-Update the `args` path to point to this server's `dist/index.js`:
-
 ```json
-"args": ["/full/path/to/asc-mcp-server/dist/index.js"]
+{
+  "mcpServers": {
+    "app-store-connect": {
+      "command": "bash",
+      "args": ["-c", "set -a && source $HOME/.env && source ./.env 2>/dev/null && exec node $HOME/asc-mcp-server/dist/index.js"]
+    }
+  }
+}
 ```
 
-Restart Claude Code. The App Store Connect tools will be available.
+How it works:
+- `set -a` — auto-exports all sourced variables
+- `source $HOME/.env` — loads shared credentials
+- `source ./.env 2>/dev/null` — loads project overrides (silent if missing)
+- `exec node ...` — launches the server
 
-## Verify
-
-After restarting Claude Code, the server should connect automatically. You can test by asking Claude to list your apps or check app status.
+Restart Claude Code after adding.
 
 ## Security
 
 - **Never commit your `.p8` private key** to any repository
-- **Never hardcode credentials** in `.mcp.json` — always use `${ENV_VAR}` references
-- The `.p8` key file should have restricted permissions: `chmod 600 AuthKey_*.p8`
+- **Never hardcode credentials** in `.mcp.json` — use the `.env` sourcing pattern
+- Secure your `.env`: `chmod 600 ~/.env`
+- Secure your key: `chmod 600 AuthKey_*.p8`
+- Add `.env` to your global gitignore: `echo ".env" >> ~/.gitignore_global`
 - Rotate keys periodically via App Store Connect
