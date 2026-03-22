@@ -1,14 +1,8 @@
 {
   "mcpServers": {
     "app-store-connect": {
-      "command": "node",
-      "args": ["dist/index.js"],
-      "env": {
-        "ASC_KEY_ID": "${ASC_KEY_ID}",
-        "ASC_ISSUER_ID": "${ASC_ISSUER_ID}",
-        "ASC_KEY_PATH": "${ASC_KEY_PATH}",
-        "ASC_CONTACT_PHONE": "${ASC_CONTACT_PHONE}"
-      }
+      "command": "bash",
+      "args": ["-c", "set -a && source $HOME/.env && source ./.env 2>/dev/null && exec node $HOME/asc-mcp-server/dist/index.js"]
     }
   }
 }
