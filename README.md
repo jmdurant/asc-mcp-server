@@ -29,19 +29,17 @@ Add to your project's `.mcp.json` (or copy the one included in this repo):
   "mcpServers": {
     "app-store-connect": {
       "command": "node",
-      "args": ["${HOME}/asc-mcp-server/dist/index.js"],
+      "args": ["/path/to/asc-mcp-server/dist/index.js"],
       "env": {
-        "HOME": "${USERPROFILE}",
         "ASC_KEY_ID": "YOUR_KEY_ID",
         "ASC_ISSUER_ID": "YOUR_ISSUER_ID",
-        "ASC_KEY_PATH": "/path/to/AuthKey_XXXXXXXX.p8"
+        "ASC_KEY_PATH": "/path/to/AuthKey_XXXXXXXX.p8",
+        "ASC_CONTACT_PHONE": "+18005551234"
       }
     }
   }
 }
 ```
-
-> The `"HOME": "${USERPROFILE}"` line ensures cross-platform compatibility (Windows sets `USERPROFILE`, macOS/Linux set `HOME`). On macOS/Linux you can remove it.
 
 The server will guide you through setup if credentials are missing or invalid.
 
