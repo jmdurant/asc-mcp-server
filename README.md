@@ -22,15 +22,16 @@ npm run build
 
 ### 3. Configure Claude Code
 
-Add to `~/.claude/settings.json`:
+Add to your project's `.mcp.json` (or copy the one included in this repo):
 
 ```json
 {
   "mcpServers": {
     "app-store-connect": {
       "command": "node",
-      "args": ["/path/to/asc-mcp-server/dist/index.js"],
+      "args": ["${HOME}/asc-mcp-server/dist/index.js"],
       "env": {
+        "HOME": "${USERPROFILE}",
         "ASC_KEY_ID": "YOUR_KEY_ID",
         "ASC_ISSUER_ID": "YOUR_ISSUER_ID",
         "ASC_KEY_PATH": "/path/to/AuthKey_XXXXXXXX.p8"
@@ -39,6 +40,10 @@ Add to `~/.claude/settings.json`:
   }
 }
 ```
+
+> The `"HOME": "${USERPROFILE}"` line ensures cross-platform compatibility (Windows sets `USERPROFILE`, macOS/Linux set `HOME`). On macOS/Linux you can remove it.
+
+The server will guide you through setup if credentials are missing or invalid.
 
 Restart Claude Code to pick up the new MCP server.
 
@@ -107,11 +112,12 @@ Once configured, just ask Claude Code naturally:
 
 ## Environment Variables
 
-| Variable | Description |
-|---|---|
-| `ASC_KEY_ID` | App Store Connect API Key ID |
-| `ASC_ISSUER_ID` | App Store Connect API Issuer ID |
-| `ASC_KEY_PATH` | Absolute path to the `.p8` private key file |
+| Variable | Required | Description |
+|---|---|---|
+| `ASC_KEY_ID` | Yes | App Store Connect API Key ID |
+| `ASC_ISSUER_ID` | Yes | App Store Connect API Issuer ID |
+| `ASC_KEY_PATH` | Yes | Absolute path to the `.p8` private key file |
+| `ASC_CONTACT_PHONE` | No | Contact phone for TestFlight beta review |
 
 ## Requirements
 

@@ -15,27 +15,33 @@ export interface ConfigError {
   error?: string;
 }
 
+function isPlaceholder(value: string): boolean {
+  return /^(YOUR_|your_|C:\/path\/|\/path\/)/i.test(value);
+}
+
 export function getConfigErrors(): ConfigError[] {
   const errors: ConfigError[] = [];
 
   const keyId = process.env.ASC_KEY_ID;
+  const keyIdMissing = !keyId || isPlaceholder(keyId);
   errors.push({
     variable: 'ASC_KEY_ID',
     description: 'Your API Key ID',
-    present: !!keyId,
-    ...(!keyId ? { error: 'Not set' } : {}),
+    present: !keyIdMissing,
+    ...(keyIdMissing ? { error: 'Not set' } : {}),
   });
 
   const issuerId = process.env.ASC_ISSUER_ID;
+  const issuerIdMissing = !issuerId || isPlaceholder(issuerId);
   errors.push({
     variable: 'ASC_ISSUER_ID',
     description: 'Your Issuer ID',
-    present: !!issuerId,
-    ...(!issuerId ? { error: 'Not set' } : {}),
+    present: !issuerIdMissing,
+    ...(issuerIdMissing ? { error: 'Not set' } : {}),
   });
 
   const keyPath = process.env.ASC_KEY_PATH;
-  if (!keyPath) {
+  if (!keyPath || isPlaceholder(keyPath)) {
     errors.push({
       variable: 'ASC_KEY_PATH',
       description: '/path/to/AuthKey_XXXXXX.p8',
