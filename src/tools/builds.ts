@@ -239,11 +239,22 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
             NSCameraUsageDescription: 'This app may use the camera.',
             NSContactsUsageDescription: 'This app may access your contacts.',
             NSFaceIDUsageDescription: 'This app may use Face ID for authentication.',
+            NSHealthShareUsageDescription: 'This app may read your health data.',
+            NSHealthUpdateUsageDescription: 'This app may write health data.',
             NSLocationWhenInUseUsageDescription: 'This app may use your location.',
             NSMicrophoneUsageDescription: 'This app may use the microphone.',
             NSPhotoLibraryUsageDescription: 'This app may access your photo library.',
+            NSSiriUsageDescription: 'This app may use Siri and shortcuts.',
             NSSpeechRecognitionUsageDescription: 'This app may use speech recognition.',
           };
+
+          // All four iPad multitasking orientations required by TMS-90474
+          const requiredOrientations = [
+            'UIInterfaceOrientationPortrait',
+            'UIInterfaceOrientationPortraitUpsideDown',
+            'UIInterfaceOrientationLandscapeLeft',
+            'UIInterfaceOrientationLandscapeRight',
+          ];
 
           // Find the main app Info.plist (look for APPL bundle type)
           const { stdout: appPlists } = await execFileAsync('find', [
@@ -281,6 +292,37 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
                   const entry = `${indent}<key>ITSAppUsesNonExemptEncryption</key>\n${indent}<false/>\n`;
                   updated = updated.slice(0, insertPoint) + entry + updated.slice(insertPoint);
                   modified = true;
+                }
+              }
+              // Inject iPad multitasking orientations (TMS-90474)
+              for (const orientKey of ['UISupportedInterfaceOrientations', 'UISupportedInterfaceOrientations~ipad']) {
+                if (!updated.includes(`<key>${orientKey}</key>`)) {
+                  const insertPoint = updated.lastIndexOf('</dict>');
+                  if (insertPoint !== -1) {
+                    const indent = updated.includes('\t<key>') ? '\t' : '    ';
+                    const arrayItems = requiredOrientations.map(o => `${indent}${indent}<string>${o}</string>`).join('\n');
+                    const entry = `${indent}<key>${orientKey}</key>\n${indent}<array>\n${arrayItems}\n${indent}</array>\n`;
+                    updated = updated.slice(0, insertPoint) + entry + updated.slice(insertPoint);
+                    modified = true;
+                  }
+                } else {
+                  // Key exists — ensure all four orientations are present
+                  for (const orient of requiredOrientations) {
+                    if (!updated.includes(orient)) {
+                      // Insert the missing orientation into the existing array
+                      const keyTag = `<key>${orientKey}</key>`;
+                      const keyPos = updated.indexOf(keyTag);
+                      if (keyPos !== -1) {
+                        const arrayEnd = updated.indexOf('</array>', keyPos);
+                        if (arrayEnd !== -1) {
+                          const indent = updated.includes('\t<key>') ? '\t' : '    ';
+                          const entry = `${indent}${indent}<string>${orient}</string>\n`;
+                          updated = updated.slice(0, arrayEnd) + entry + updated.slice(arrayEnd);
+                          modified = true;
+                        }
+                      }
+                    }
+                  }
                 }
               }
               if (modified) {
@@ -664,6 +706,8 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
           const privacyKeys: Array<{ key: string; label: string }> = [
             { key: 'NSBluetoothAlwaysUsageDescription', label: 'Bluetooth' },
             { key: 'NSBluetoothPeripheralUsageDescription', label: 'Bluetooth Peripheral' },
+            { key: 'NSHealthShareUsageDescription', label: 'HealthKit (read)' },
+            { key: 'NSHealthUpdateUsageDescription', label: 'HealthKit (write)' },
             { key: 'NSSpeechRecognitionUsageDescription', label: 'Speech Recognition' },
             { key: 'NSHomeKitUsageDescription', label: 'HomeKit' },
             { key: 'NSFaceIDUsageDescription', label: 'Face ID' },
@@ -671,6 +715,7 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
             { key: 'NSCameraUsageDescription', label: 'Camera' },
             { key: 'NSMicrophoneUsageDescription', label: 'Microphone' },
             { key: 'NSPhotoLibraryUsageDescription', label: 'Photo Library' },
+            { key: 'NSSiriUsageDescription', label: 'Siri' },
           ];
 
           const findAppPlists = (dir: string): string[] => {
@@ -704,13 +749,99 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
             } else {
               ok.push(`Privacy usage descriptions: all ${privacyKeys.length} common keys present`);
             }
+
+            // Check that no usage description contains the word "apple" — Apple rejects these
+            const appleRegex = /<key>(NS\w*UsageDescription)<\/key>\s*<string>([^<]*\bapple\b[^<]*)<\/string>/gi;
+            let appleMatch;
+            for (const plist of appPlists) {
+              const plistContent = readFilePriv(plist, 'utf8');
+              const relative = plist.replace(projectDirPriv + '/', '');
+              while ((appleMatch = appleRegex.exec(plistContent)) !== null) {
+                issues.push(
+                  `Usage description for ${appleMatch[1]} in ${relative} contains the word "apple":\n` +
+                  `   "${appleMatch[2]}"\n` +
+                  `   → Apple rejects descriptions that reference their brand. Remove or rephrase it.`
+                );
+              }
+            }
           }
         } catch {
           // Non-fatal
         }
       }
 
-      // 7. Check app icon asset catalog
+      // 7. Check iPad multitasking orientations (TMS-90474)
+      if (projectPath) {
+        try {
+          const { readFileSync: readFileOrient, readdirSync: readDirOrient } = await import('node:fs');
+          const { dirname: dirnameOrient, join: joinOrient } = await import('node:path');
+          const projectDirOrient = dirnameOrient(projectPath);
+
+          const requiredOrientations = [
+            'UIInterfaceOrientationPortrait',
+            'UIInterfaceOrientationPortraitUpsideDown',
+            'UIInterfaceOrientationLandscapeLeft',
+            'UIInterfaceOrientationLandscapeRight',
+          ];
+
+          const findAppPlistsOrient = (dir: string): string[] => {
+            const results: string[] = [];
+            try {
+              for (const entry of readDirOrient(dir, { withFileTypes: true })) {
+                if (entry.name === 'Info.plist' && entry.isFile()) {
+                  results.push(joinOrient(dir, entry.name));
+                } else if (entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'Pods' && entry.name !== 'build' && !entry.name.endsWith('.xcodeproj') && !entry.name.endsWith('.xcworkspace')) {
+                  results.push(...findAppPlistsOrient(joinOrient(dir, entry.name)));
+                }
+              }
+            } catch { /* skip */ }
+            return results;
+          };
+
+          const orientPlists = findAppPlistsOrient(projectDirOrient)
+            .filter(p => {
+              try {
+                const c = readFileOrient(p, 'utf8');
+                return c.includes('CFBundlePackageType') && c.includes('APPL');
+              } catch { return false; }
+            });
+
+          for (const plist of orientPlists) {
+            const content = readFileOrient(plist, 'utf8');
+            const relative = plist.replace(projectDirOrient + '/', '');
+
+            for (const orientKey of ['UISupportedInterfaceOrientations', 'UISupportedInterfaceOrientations~ipad']) {
+              if (!content.includes(`<key>${orientKey}</key>`)) {
+                issues.push(
+                  `Missing ${orientKey} in ${relative}.\n` +
+                  `   → Required for iPad multitasking. upload_build will auto-inject all four orientations.`
+                );
+              } else {
+                const missing = requiredOrientations.filter(o => !content.includes(o));
+                if (missing.length > 0) {
+                  issues.push(
+                    `${orientKey} in ${relative} is missing orientations: ${missing.join(', ')}.\n` +
+                    `   → All four orientations are required for iPad multitasking. upload_build will auto-inject missing ones.`
+                  );
+                }
+              }
+            }
+
+            // If both keys pass, report OK once per plist
+            const iPhoneOk = content.includes('<key>UISupportedInterfaceOrientations</key>') &&
+              requiredOrientations.every(o => content.includes(o));
+            const iPadOk = content.includes('<key>UISupportedInterfaceOrientations~ipad</key>') &&
+              requiredOrientations.every(o => content.includes(o));
+            if (iPhoneOk && iPadOk) {
+              ok.push(`iPad multitasking orientations: all four present in ${relative}`);
+            }
+          }
+        } catch {
+          // Non-fatal
+        }
+      }
+
+      // 8. Check app icon asset catalog
       if (projectPath) {
         try {
           const { readdirSync: readDir6, readFileSync: readFile6 } = await import('node:fs');
@@ -775,7 +906,7 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
         }
       }
 
-      // 8. Check build number consistency and ASC build number
+      // 9. Check build number consistency and ASC build number
       if (projectPath) {
         try {
           const { readFileSync: readFileVer } = await import('node:fs');

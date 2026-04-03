@@ -202,11 +202,22 @@ export function registerDeployTools(server: McpServer, client: AppStoreConnectCl
             NSCameraUsageDescription: 'This app may use the camera.',
             NSContactsUsageDescription: 'This app may access your contacts.',
             NSFaceIDUsageDescription: 'This app may use Face ID for authentication.',
+            NSHealthShareUsageDescription: 'This app may read your health data.',
+            NSHealthUpdateUsageDescription: 'This app may write health data.',
             NSLocationWhenInUseUsageDescription: 'This app may use your location.',
             NSMicrophoneUsageDescription: 'This app may use the microphone.',
             NSPhotoLibraryUsageDescription: 'This app may access your photo library.',
+            NSSiriUsageDescription: 'This app may use Siri and shortcuts.',
             NSSpeechRecognitionUsageDescription: 'This app may use speech recognition.',
           };
+
+          // All four iPad multitasking orientations required by TMS-90474
+          const requiredOrientations = [
+            'UIInterfaceOrientationPortrait',
+            'UIInterfaceOrientationPortraitUpsideDown',
+            'UIInterfaceOrientationLandscapeLeft',
+            'UIInterfaceOrientationLandscapeRight',
+          ];
 
           const { stdout: appPlists } = await execFileAsync('find', [
             pDir, '-name', 'Info.plist',
@@ -243,9 +254,39 @@ export function registerDeployTools(server: McpServer, client: AppStoreConnectCl
                   modified = true;
                 }
               }
+              // Inject iPad multitasking orientations (TMS-90474)
+              for (const orientKey of ['UISupportedInterfaceOrientations', 'UISupportedInterfaceOrientations~ipad']) {
+                if (!updated.includes(`<key>${orientKey}</key>`)) {
+                  const insertPoint = updated.lastIndexOf('</dict>');
+                  if (insertPoint !== -1) {
+                    const indent = updated.includes('\t<key>') ? '\t' : '    ';
+                    const arrayItems = requiredOrientations.map(o => `${indent}${indent}<string>${o}</string>`).join('\n');
+                    const entry = `${indent}<key>${orientKey}</key>\n${indent}<array>\n${arrayItems}\n${indent}</array>\n`;
+                    updated = updated.slice(0, insertPoint) + entry + updated.slice(insertPoint);
+                    modified = true;
+                  }
+                } else {
+                  // Key exists — ensure all four orientations are present
+                  for (const orient of requiredOrientations) {
+                    if (!updated.includes(orient)) {
+                      const keyTag = `<key>${orientKey}</key>`;
+                      const keyPos = updated.indexOf(keyTag);
+                      if (keyPos !== -1) {
+                        const arrayEnd = updated.indexOf('</array>', keyPos);
+                        if (arrayEnd !== -1) {
+                          const indent = updated.includes('\t<key>') ? '\t' : '    ';
+                          const entry = `${indent}${indent}<string>${orient}</string>\n`;
+                          updated = updated.slice(0, arrayEnd) + entry + updated.slice(arrayEnd);
+                          modified = true;
+                        }
+                      }
+                    }
+                  }
+                }
+              }
               if (modified) {
                 writePlist(plist, updated, 'utf8');
-                info('Injected missing privacy/compliance keys into Info.plist');
+                info('Injected missing privacy/compliance/orientation keys into Info.plist');
               }
             } catch { /* skip */ }
           }
