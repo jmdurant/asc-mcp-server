@@ -578,26 +578,74 @@ export function registerDeployTools(server: McpServer, client: AppStoreConnectCl
           info(`External group exists: "${extGroupName}"`);
         }
 
-        // Add build to both groups
-        if (buildId) {
-          for (const group of [intGroup, extGroup]) {
-            try {
-              await client.request(`/v1/betaGroups/${group.id}/relationships/builds`, {
-                method: 'POST',
-                body: { data: [{ type: 'builds', id: buildId }] },
-              });
-              info(`Added build to "${group.attributes.name}"`);
-            } catch (e) {
-              if (e instanceof AppStoreConnectError && e.status === 409) {
-                info(`Build already in "${group.attributes.name}"`);
-              } else {
-                warn(`Failed to add build to "${group.attributes.name}": ${e instanceof Error ? e.message : String(e)}`);
+        // Add internal team members to internal group (must happen before adding build)
+        if (intGroup) {
+          try {
+            const teamUsers = await client.requestAll('/v1/users', {
+              'fields[users]': 'firstName,lastName,username,roles',
+              'limit': '50',
+            }) as Array<{ id: string; attributes: { firstName: string; lastName: string; username: string; roles: string[] } }>;
+
+            // Internal testers must be ASC users with eligible roles
+            const internalRoles = ['ACCOUNT_HOLDER', 'ADMIN', 'APP_MANAGER', 'DEVELOPER', 'MARKETING'];
+            const eligibleUsers = teamUsers.filter(u =>
+              u.attributes.roles?.some(r => internalRoles.includes(r))
+            );
+
+            if (eligibleUsers.length > 0) {
+              // Find or create betaTester records for these users and add to internal group
+              for (const user of eligibleUsers) {
+                try {
+                  // Look up existing betaTester by email
+                  const existing = await client.requestAll('/v1/betaTesters', {
+                    'filter[email]': user.attributes.username,
+                    'fields[betaTesters]': 'email',
+                    'limit': '1',
+                  }) as Array<{ id: string }>;
+
+                  if (existing.length > 0) {
+                    // Add existing tester to internal group
+                    try {
+                      await client.request(`/v1/betaGroups/${intGroup.id}/relationships/betaTesters`, {
+                        method: 'POST',
+                        body: { data: [{ type: 'betaTesters', id: existing[0].id }] },
+                      });
+                    } catch (e) {
+                      if (!(e instanceof AppStoreConnectError && e.status === 409)) throw e;
+                    }
+                  } else {
+                    // Create betaTester and add to internal group
+                    await client.request('/v1/betaTesters', {
+                      method: 'POST',
+                      body: {
+                        data: {
+                          type: 'betaTesters',
+                          attributes: {
+                            email: user.attributes.username,
+                            firstName: user.attributes.firstName,
+                            lastName: user.attributes.lastName,
+                          },
+                          relationships: {
+                            betaGroups: { data: [{ type: 'betaGroups', id: intGroup.id }] },
+                          },
+                        },
+                      },
+                    });
+                  }
+                } catch (e) {
+                  if (!(e instanceof AppStoreConnectError && e.status === 409)) {
+                    warn(`Failed to add internal tester ${user.attributes.username}: ${e instanceof Error ? e.message : String(e)}`);
+                  }
+                }
               }
+              info(`Added ${eligibleUsers.length} team member(s) to "${intGroup.attributes.name}"`);
             }
+          } catch (e) {
+            warn(`Failed to add internal testers: ${e instanceof Error ? e.message : String(e)}`);
           }
         }
 
-        // Add testers to external group
+        // Add provided testers to external group (must happen before adding build)
         if (testers && testers.length > 0 && extGroup) {
           for (const tester of testers) {
             try {
@@ -619,6 +667,25 @@ export function registerDeployTools(server: McpServer, client: AppStoreConnectCl
                 info(`Tester already exists: ${tester.email}`);
               } else {
                 warn(`Failed to add tester ${tester.email}: ${e instanceof Error ? e.message : String(e)}`);
+              }
+            }
+          }
+        }
+
+        // Add build to both groups (after testers are in place)
+        if (buildId) {
+          for (const group of [intGroup, extGroup]) {
+            try {
+              await client.request(`/v1/betaGroups/${group.id}/relationships/builds`, {
+                method: 'POST',
+                body: { data: [{ type: 'builds', id: buildId }] },
+              });
+              info(`Added build to "${group.attributes.name}"`);
+            } catch (e) {
+              if (e instanceof AppStoreConnectError && e.status === 409) {
+                info(`Build already in "${group.attributes.name}"`);
+              } else {
+                warn(`Failed to add build to "${group.attributes.name}": ${e instanceof Error ? e.message : String(e)}`);
               }
             }
           }
