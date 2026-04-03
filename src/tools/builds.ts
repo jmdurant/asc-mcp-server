@@ -126,6 +126,7 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
 
         // Auto-increment build number if needed
         let buildNumberOverride: string | undefined;
+        let autoIncrementWarning = '';
         if (autoIncrementBuildNumber !== false) {
           try {
             // Get current build settings from the project
@@ -138,7 +139,9 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
             const currentBuildNum = settingsOut.match(/CURRENT_PROJECT_VERSION = (.+)/)?.[1]?.trim();
             const currentBundleId = settingsOut.match(/(?<![_\w])PRODUCT_BUNDLE_IDENTIFIER = (.+)/)?.[1]?.trim();
 
-            if (currentBundleId) {
+            if (!currentBundleId) {
+              autoIncrementWarning = 'Auto-increment: could not detect bundle ID from build settings — skipped.';
+            } else {
               // Resolve app ID from bundle ID if not provided
               let checkAppId = appId;
               if (!checkAppId) {
@@ -149,7 +152,9 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
                 checkAppId = apps[0]?.id;
               }
 
-              if (checkAppId) {
+              if (!checkAppId) {
+                autoIncrementWarning = `Auto-increment: no app found in ASC for bundle ID '${currentBundleId}' — skipped.`;
+              } else {
                 // Get existing builds sorted by most recent
                 const existingBuilds = await client.requestAll('/v1/builds', {
                   'filter[app]': checkAppId,
@@ -171,8 +176,8 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
                 }
               }
             }
-          } catch {
-            // Non-fatal — proceed with current build number
+          } catch (err) {
+            autoIncrementWarning = `Auto-increment failed: ${err instanceof Error ? err.message : String(err)} — proceeding with project build number.`;
           }
         }
 
@@ -527,11 +532,12 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
         const incrementNote = buildNumberOverride
           ? `\nBuild number auto-incremented: ${buildNumberOverride} (was ${bundleVersion} in project)`
           : '';
+        const warnNote = autoIncrementWarning ? `\n⚠️ ${autoIncrementWarning}` : '';
 
         return {
           content: [{
             type: 'text' as const,
-            text: `Build pipeline complete!\nScheme: ${scheme}\nBundle ID: ${bundleId}\nVersion: ${bundleShortVersion} (${bundleVersion})${incrementNote}\nArtifact: ${artifact}\n\n${result}`,
+            text: `Build pipeline complete!\nScheme: ${scheme}\nBundle ID: ${bundleId}\nVersion: ${bundleShortVersion} (${bundleVersion})${incrementNote}${warnNote}\nArtifact: ${artifact}\n\n${result}`,
           }],
         };
       } catch (error) {
@@ -977,6 +983,65 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
               }
             }
           } catch { /* non-fatal — ASC check is best-effort in preflight */ }
+        } catch {
+          // Non-fatal
+        }
+      }
+
+      // 10. Check that CFBundleVersion uses $(CURRENT_PROJECT_VERSION) build setting variable
+      // XcodeGen and other project generators often hardcode the version, which prevents
+      // xcodebuild build setting overrides (including auto-increment) from taking effect.
+      if (projectPath) {
+        try {
+          const { readdirSync: readDirBV, readFileSync: readFileBV } = await import('node:fs');
+          const { dirname: dirnameBV, join: joinBV } = await import('node:path');
+          const projectDirBV = dirnameBV(projectPath);
+
+          const findAppPlistsBV = (dir: string): string[] => {
+            const results: string[] = [];
+            try {
+              for (const entry of readDirBV(dir, { withFileTypes: true })) {
+                if (entry.name === 'Info.plist' && entry.isFile()) {
+                  results.push(joinBV(dir, entry.name));
+                } else if (entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'Pods' && entry.name !== 'build' && entry.name !== 'DerivedData' && !entry.name.endsWith('.xcodeproj') && !entry.name.endsWith('.xcworkspace')) {
+                  results.push(...findAppPlistsBV(joinBV(dir, entry.name)));
+                }
+              }
+            } catch { /* skip */ }
+            return results;
+          };
+
+          const bvPlists = findAppPlistsBV(projectDirBV);
+          const hardcodedBV: string[] = [];
+
+          for (const plist of bvPlists) {
+            try {
+              const content = readFileBV(plist, 'utf8');
+              // Only check app/extension plists that have CFBundleVersion
+              if (!content.includes('CFBundleVersion')) continue;
+
+              // Check if CFBundleVersion uses the build setting variable
+              const bvMatch = content.match(/<key>CFBundleVersion<\/key>\s*<string>([^<]*)<\/string>/);
+              if (bvMatch) {
+                const value = bvMatch[1];
+                if (value !== '$(CURRENT_PROJECT_VERSION)' && !value.includes('CURRENT_PROJECT_VERSION')) {
+                  const relative = plist.replace(projectDirBV + '/', '');
+                  hardcodedBV.push(`${relative}: CFBundleVersion = "${value}"`);
+                }
+              }
+            } catch { /* skip unreadable */ }
+          }
+
+          if (hardcodedBV.length > 0) {
+            issues.push(
+              `CFBundleVersion is hardcoded instead of using $(CURRENT_PROJECT_VERSION):\n` +
+              hardcodedBV.map(p => `   → ${p}`).join('\n') + '\n' +
+              '   This prevents build number auto-increment from working via xcodebuild overrides.\n' +
+              '   Fix: set CFBundleVersion to $(CURRENT_PROJECT_VERSION) in your Info.plist (or project.yml plist template).'
+            );
+          } else if (bvPlists.length > 0) {
+            ok.push('CFBundleVersion uses $(CURRENT_PROJECT_VERSION) build setting variable');
+          }
         } catch {
           // Non-fatal
         }
