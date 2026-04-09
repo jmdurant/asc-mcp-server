@@ -9,6 +9,112 @@ import { uploadBuildViaAPI } from '../upload.js';
 
 const execFileAsync = promisify(execFile);
 
+// ── XcodeGen Awareness ──
+//
+// Some Xcode projects are managed by XcodeGen (https://github.com/yonaskolb/XcodeGen) —
+// the .xcodeproj is regenerated from a project.yml file. Build settings written directly
+// to the .xcodeproj or Info.plist files get overwritten on the next `xcodegen generate`.
+//
+// For these projects we need to:
+//   1. Bump CURRENT_PROJECT_VERSION in project.yml (the source of truth)
+//   2. Run `xcodegen generate` so the working tree reflects the bump
+//   3. Skip plutil-replace for plists that already use $(CURRENT_PROJECT_VERSION) placeholder
+//   4. Warn if project.yml's info.properties block doesn't include CFBundleVersion as a placeholder
+//      (which is the trap that bites users who only edit the .plist files directly)
+
+interface XcodeGenContext {
+  isXcodeGen: boolean;
+  projectYmlPath?: string;
+  hasXcodeGenBinary?: boolean;
+  warnings: string[];
+}
+
+async function detectXcodeGenContext(projectPath: string): Promise<XcodeGenContext> {
+  const ctx: XcodeGenContext = { isXcodeGen: false, warnings: [] };
+  try {
+    const path = await import('node:path');
+    const { existsSync, readFileSync } = await import('node:fs');
+    const projectDir = path.dirname(projectPath);
+    const candidate = path.join(projectDir, 'project.yml');
+    if (!existsSync(candidate)) return ctx;
+    ctx.isXcodeGen = true;
+    ctx.projectYmlPath = candidate;
+
+    // Check if xcodegen is on PATH (we'll use it to regenerate after bumping)
+    try {
+      await execFileAsync('which', ['xcodegen'], { timeout: 5000 });
+      ctx.hasXcodeGenBinary = true;
+    } catch {
+      ctx.hasXcodeGenBinary = false;
+      ctx.warnings.push('XcodeGen project detected but `xcodegen` binary not found on PATH. Install it (`brew install xcodegen`) so asc-mcp can regenerate after bumping CURRENT_PROJECT_VERSION.');
+    }
+
+    // Sniff project.yml for the CFBundleVersion placeholder pattern in info.properties.
+    // If it's missing, the user will hit the "xcodegen resets CFBundleVersion to 1" trap.
+    try {
+      const yml = readFileSync(candidate, 'utf-8');
+      // Loose check — we look for any line that maps CFBundleVersion to $(CURRENT_PROJECT_VERSION)
+      // under an info.properties block. Doesn't need to be a full YAML parse.
+      const hasPlaceholder = /CFBundleVersion:\s*\$\(CURRENT_PROJECT_VERSION\)/.test(yml);
+      if (!hasPlaceholder) {
+        ctx.warnings.push(
+          'project.yml info.properties block does not include `CFBundleVersion: $(CURRENT_PROJECT_VERSION)`. ' +
+          'XcodeGen will reset the build number to "1" on every regenerate. ' +
+          'Add this line to each generated plist target to make build numbers flow through automatically:\n' +
+          '    info:\n' +
+          '      properties:\n' +
+          '        CFBundleVersion: $(CURRENT_PROJECT_VERSION)\n' +
+          '        CFBundleShortVersionString: $(MARKETING_VERSION)'
+        );
+      }
+    } catch { /* unreadable — non-fatal */ }
+  } catch { /* fs/path import failed — non-fatal */ }
+  return ctx;
+}
+
+/// Update CURRENT_PROJECT_VERSION in a project.yml file in place. Returns true on success.
+async function bumpXcodeGenProjectVersion(projectYmlPath: string, newVersion: string): Promise<boolean> {
+  try {
+    const { readFileSync, writeFileSync } = await import('node:fs');
+    const yml = readFileSync(projectYmlPath, 'utf-8');
+    // Match: CURRENT_PROJECT_VERSION: "<anything>" or CURRENT_PROJECT_VERSION: <number>
+    const updated = yml.replace(
+      /(CURRENT_PROJECT_VERSION:\s*)("?)([^"\n]+)("?)/,
+      (_, prefix, openQ, _val, closeQ) => `${prefix}${openQ || '"'}${newVersion}${closeQ || '"'}`
+    );
+    if (updated === yml) return false;  // pattern not found
+    writeFileSync(projectYmlPath, updated, 'utf-8');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/// Run `xcodegen generate` in the directory containing project.yml. Returns true on success.
+async function regenerateXcodeGenProject(projectYmlPath: string): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const path = await import('node:path');
+    const cwd = path.dirname(projectYmlPath);
+    await execFileAsync('xcodegen', ['generate'], { cwd, timeout: 60000 });
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/// Check whether a plist file's CFBundleVersion is a placeholder like $(CURRENT_PROJECT_VERSION).
+/// If so, the plutil-replace step is unnecessary (and can break Xcode's variable resolution).
+async function plistUsesBuildVersionPlaceholder(plistPath: string): Promise<boolean> {
+  try {
+    const { readFileSync } = await import('node:fs');
+    const content = readFileSync(plistPath, 'utf-8');
+    // Look for CFBundleVersion key followed by a $(...) placeholder string
+    return /<key>CFBundleVersion<\/key>\s*<string>\$\([^)]+\)<\/string>/.test(content);
+  } catch {
+    return false;
+  }
+}
+
 export function registerBuildTools(server: McpServer, client: AppStoreConnectClient, config: Config) {
   server.tool(
     'list_builds',
@@ -124,6 +230,11 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
 </plist>`);
         }
 
+        // Detect XcodeGen-managed project (project.yml next to .xcodeproj).
+        // If found, we'll bump CURRENT_PROJECT_VERSION there and regenerate, so the
+        // working tree stays in sync with what we're about to upload.
+        const xcodeGen = await detectXcodeGenContext(projectPath);
+
         // Auto-increment build number if needed
         let buildNumberOverride: string | undefined;
         let autoIncrementWarning = '';
@@ -199,8 +310,27 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
           // Also set FLUTTER_BUILD_NUMBER for Flutter projects
           archiveArgs.push(`FLUTTER_BUILD_NUMBER=${buildNumberOverride}`);
 
+          // XcodeGen path: bump CURRENT_PROJECT_VERSION in project.yml and regenerate.
+          // This keeps the working tree consistent so the user's next `xcodegen generate`
+          // (or any other action that triggers project regen) doesn't reset the build number.
+          if (xcodeGen.isXcodeGen && xcodeGen.projectYmlPath) {
+            const bumped = await bumpXcodeGenProjectVersion(xcodeGen.projectYmlPath, buildNumberOverride);
+            if (bumped) {
+              if (xcodeGen.hasXcodeGenBinary) {
+                const regen = await regenerateXcodeGenProject(xcodeGen.projectYmlPath);
+                if (!regen.ok) {
+                  xcodeGen.warnings.push(`xcodegen generate after version bump failed: ${regen.error}`);
+                }
+              }
+            } else {
+              xcodeGen.warnings.push(`Could not find CURRENT_PROJECT_VERSION in ${xcodeGen.projectYmlPath} — XcodeGen sync skipped.`);
+            }
+          }
+
           // Update Info.plists in sub-projects (watch apps, widgets, extensions)
-          // that may have hardcoded CFBundleVersion not overridden by xcodebuild settings
+          // that may have hardcoded CFBundleVersion not overridden by xcodebuild settings.
+          // Skip plists that already use a $(...) placeholder — those resolve at build time
+          // via the xcodebuild override and shouldn't be rewritten.
           try {
             const path = await import('node:path');
             const projectDir = path.dirname(projectPath);
@@ -214,6 +344,10 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
                   '-not', '-path', '*/build/*', '-maxdepth', '5',
                 ], { timeout: 10_000 });
                 for (const plist of plists.trim().split('\n').filter(Boolean)) {
+                  // If the plist already has $(...) placeholder, leave it alone — Xcode
+                  // resolves it at build time using the CURRENT_PROJECT_VERSION override.
+                  if (await plistUsesBuildVersionPlaceholder(plist)) continue;
+
                   try {
                     const { stdout: version } = await execFileAsync('plutil', [
                       '-extract', 'CFBundleVersion', 'raw', '-o', '-', plist,
@@ -533,11 +667,18 @@ export function registerBuildTools(server: McpServer, client: AppStoreConnectCli
           ? `\nBuild number auto-incremented: ${buildNumberOverride} (was ${bundleVersion} in project)`
           : '';
         const warnNote = autoIncrementWarning ? `\n⚠️ ${autoIncrementWarning}` : '';
+        const xcodeGenNote = xcodeGen.isXcodeGen
+          ? `\nXcodeGen project detected: ${xcodeGen.projectYmlPath}` +
+            (buildNumberOverride ? ` (project.yml CURRENT_PROJECT_VERSION synced to ${buildNumberOverride})` : '')
+          : '';
+        const xcodeGenWarnings = xcodeGen.warnings.length > 0
+          ? '\n' + xcodeGen.warnings.map(w => `⚠️ XcodeGen: ${w}`).join('\n')
+          : '';
 
         return {
           content: [{
             type: 'text' as const,
-            text: `Build pipeline complete!\nScheme: ${scheme}\nBundle ID: ${bundleId}\nVersion: ${bundleShortVersion} (${bundleVersion})${incrementNote}${warnNote}\nArtifact: ${artifact}\n\n${result}`,
+            text: `Build pipeline complete!\nScheme: ${scheme}\nBundle ID: ${bundleId}\nVersion: ${bundleShortVersion} (${bundleVersion})${incrementNote}${warnNote}${xcodeGenNote}${xcodeGenWarnings}\nArtifact: ${artifact}\n\n${result}`,
           }],
         };
       } catch (error) {
